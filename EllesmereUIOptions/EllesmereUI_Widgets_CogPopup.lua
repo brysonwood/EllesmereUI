@@ -276,12 +276,14 @@ local function BuildCogPopup(opts)
                     tmpFS:SetText(EllesmereUI.L(row.label))
                     local w = tmpFS:GetStringWidth() + (((row.type == "dropdown" or row.type == "reordercheck") and row.ddWidth) or COG_DD_W)
                     if w > maxDDNeed then maxDDNeed = w end
-                elseif row.type == "toggle" or row.type == "colorpicker" or row.type == "multiswatch" or row.type == "button" then
+                elseif row.type == "toggle" or row.type == "colorpicker" or row.type == "multiswatch" or row.type == "button" or row.type == "togglecolor" then
                     -- A long label must not run under the right-aligned switch or swatches, or past a button's edges.
                     tmpFS:SetText(EllesmereUI.L(row.label))
                     local control = TG_W
                     if row.type == "colorpicker" then
                         control = 20
+                    elseif row.type == "togglecolor" then
+                        control = TG_W + 28
                     elseif row.type == "multiswatch" then
                         control = #(row.swatches or {}) * 28
                     elseif row.type == "button" then
@@ -320,7 +322,7 @@ local function BuildCogPopup(opts)
         local SLIDER_LEFT, SLIDER_W, POPUP_W = cols[1].sliderLeft, cols[1].sliderW, cols[1].w
 
         local function RowH(row)
-            if row.type == "toggle" or row.type == "segmented" then
+            if row.type == "toggle" or row.type == "segmented" or row.type == "togglecolor" then
                 return TOGGLE_ROW_H
             elseif row.type == "dropdown" or row.type == "reorder" or row.type == "reordercheck" then
                 return DROPDOWN_ROW_H
@@ -369,10 +371,13 @@ local function BuildCogPopup(opts)
         end
         totalH = totalH + TOP_PAD
 
-        -- Footer (optional unlock mode link)
+        -- Footer (optional unlock mode link or action button)
         local FOOTER_H = 0
         if opts.footer and opts.footer.unlockKey then
             FOOTER_H = 42  -- 2 lines of small text + padding
+            totalH = totalH + FOOTER_H
+        elseif opts.footer and opts.footer.buttonText then
+            FOOTER_H = 34  -- centered button + padding
             totalH = totalH + FOOTER_H
         end
 
@@ -759,6 +764,101 @@ local function BuildCogPopup(opts)
                 end
 
                 curY = curY - ROW_H
+            elseif row.type == "togglecolor" then
+                local lbl = MakeFont(pf, 11, nil, 1, 1, 1); lbl:SetAlpha(0.6)
+                lbl:SetText(EllesmereUI.L(row.label))
+                lbl:SetPoint("LEFT", ca, "TOPLEFT", SIDE_PAD, curY - TOGGLE_ROW_H / 2 - 1)
+
+                if row.tooltip then
+                    local hitFrame = CreateFrame("Frame", nil, pf)
+                    hitFrame:SetPoint("TOPLEFT", lbl, "TOPLEFT", -2, 2)
+                    hitFrame:SetPoint("BOTTOMRIGHT", lbl, "BOTTOMRIGHT", 2, -2)
+                    hitFrame:SetFrameLevel(pf:GetFrameLevel() + 3)
+                    hitFrame:EnableMouse(true)
+                    hitFrame:SetScript("OnEnter", function()
+                        EllesmereUI.ShowWidgetTooltip(lbl, row.tooltip)
+                    end)
+                    hitFrame:SetScript("OnLeave", function()
+                        EllesmereUI.HideWidgetTooltip()
+                    end)
+                end
+
+                local getToggle = row.getToggle or row.get
+                local setToggle = row.setToggle or row.set
+                local getColor = row.getColor
+                local setColor = row.setColor
+
+                local cogToggle, _, cogSnap = BuildToggleControl(pf, pf:GetFrameLevel() + 2,
+                    getToggle,
+                    function(v)
+                        if setToggle then setToggle(v) end
+                    end, { sizeRatio = 0.8, noAnim = true })
+                cogToggle:SetPoint("RIGHT", ca, "TOPRIGHT", -SIDE_PAD, curY - TOGGLE_ROW_H / 2)
+
+                local cpSwatch, cpUpdate = BuildColorSwatch(pf, pf:GetFrameLevel() + 2,
+                    getColor,
+                    function(r, g, b, a)
+                        if setColor then setColor(r, g, b, a) end
+                        if pf._refresh then pf._refresh() end
+                    end,
+                    row.hasAlpha, 20)
+                cpSwatch:ClearAllPoints()
+                cpSwatch:SetPoint("RIGHT", cogToggle, "LEFT", -8, 0)
+
+                local function UpdateVisuals()
+                    cogSnap()
+                    local on = getToggle and getToggle()
+                    cpSwatch:SetAlpha(on and 1.0 or 0.3)
+                    cpUpdate()
+                end
+                UpdateVisuals()
+
+                cogToggle:SetScript("OnClick", function()
+                    local cur = getToggle and getToggle()
+                    local nxt = not cur
+                    if setToggle then setToggle(nxt) end
+                    UpdateVisuals()
+                    if pf._refresh then pf._refresh() end
+                end)
+
+                local origSwatchClick = cpSwatch:GetScript("OnClick")
+                cpSwatch:SetScript("OnClick", function(self, ...)
+                    local on = getToggle and getToggle()
+                    if not on and setToggle then
+                        setToggle(true)
+                        UpdateVisuals()
+                    end
+                    if origSwatchClick then origSwatchClick(self, ...) end
+                end)
+
+                local tcDis
+                if row.disabled then
+                    tcDis = CreateFrame("Frame", nil, pf)
+                    tcDis:SetPoint("TOPLEFT", ca, "TOPLEFT", 1, curY)
+                    tcDis:SetPoint("TOPRIGHT", ca, "TOPRIGHT", -1, curY)
+                    tcDis:SetHeight(TOGGLE_ROW_H)
+                    tcDis:SetFrameLevel(pf:GetFrameLevel() + 10)
+                    tcDis:EnableMouse(true)
+                    local disTex = SolidTex(tcDis, "OVERLAY", 0.077, 0.068, 0.058, 0.70)
+                    disTex:SetAllPoints()
+                    tcDis:SetScript("OnEnter", function(self)
+                        local tip = ResolveDisabledTip(row)
+                        if tip and EllesmereUI.ShowWidgetTooltip then
+                            EllesmereUI.ShowWidgetTooltip(self, tip)
+                        end
+                    end)
+                    tcDis:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+                    local initDis = type(row.disabled) == "function" and row.disabled() or row.disabled
+                    if initDis then tcDis:Show() else tcDis:Hide() end
+                end
+
+                rowWidgets[#rowWidgets + 1] = {
+                    type = "togglecolor",
+                    updateVisual = UpdateVisuals,
+                    disOverlay = tcDis,
+                    disCheck = row.disabled
+                }
+                curY = curY - TOGGLE_ROW_H
             elseif row.type == 'multiswatch' then
                 -- Cog-row form of the main-page multiSwatch slot: label + N swatches right-to-left from the right edge; click one or the other, the inactive one dims. Same swatch spec: getValue/setValue/hasAlpha/tooltip/onClick (original picker click stashed on _eabOrigClick)/refreshAlpha.
                 local lbl = MakeFont(pf, 11, nil, 1, 1, 1); lbl:SetAlpha(0.6)
@@ -1301,6 +1401,39 @@ local function BuildCogPopup(opts)
                 unlockFS:SetTextColor(_ugr, _ugg, _ugb)
                 unlockFS:SetAlpha(0.9)
             end)
+        elseif opts.footer and opts.footer.buttonText and opts.footer.buttonAction then
+            local footerY = curY - 6
+            local btn = CreateFrame("Button", nil, pf)
+            PP.Size(btn, opts.footer.buttonWidth or 160, 22)
+            PP.Point(btn, "TOP", pf, "TOPLEFT", POPUP_W / 2, footerY)
+            btn:SetFrameLevel(pf:GetFrameLevel() + 2)
+            local btnBg = SolidTex(btn, "BACKGROUND", 0.18, 0.18, 0.18, 0.85)
+            btnBg:SetAllPoints()
+            local btnBrd = EllesmereUI.MakeRoundedBorder(btn, 1, 1, 1, 0.15, btnBg)
+            local btnLbl = MakeFont(btn, 11, nil, 1, 1, 1)
+            btnLbl:SetAlpha(0.8)
+            btnLbl:SetPoint("CENTER")
+            btnLbl:SetText(EllesmereUI.L(opts.footer.buttonText))
+            btn:SetScript("OnEnter", function(self)
+                btnBg:SetColorTexture(0.25, 0.25, 0.25, 0.85)
+                btnBrd:SetColor(1, 1, 1, 0.3)
+                btnLbl:SetAlpha(1)
+                if opts.footer.buttonTooltip and EllesmereUI.ShowWidgetTooltip then
+                    EllesmereUI.ShowWidgetTooltip(self, opts.footer.buttonTooltip)
+                end
+            end)
+            btn:SetScript("OnLeave", function()
+                btnBg:SetColorTexture(0.18, 0.18, 0.18, 0.85)
+                btnBrd:SetColor(1, 1, 1, 0.15)
+                btnLbl:SetAlpha(0.8)
+                if opts.footer.buttonTooltip and EllesmereUI.HideWidgetTooltip then
+                    EllesmereUI.HideWidgetTooltip()
+                end
+            end)
+            btn:SetScript("OnClick", function()
+                opts.footer.buttonAction()
+                if pf._refresh then pf._refresh() end
+            end)
         end
         -- Re-read every get function and update visuals
         pf._refresh = function()
@@ -1313,6 +1446,13 @@ local function BuildCogPopup(opts)
                     end
                     if rw.updateVisual and rw.get then rw.updateVisual(rw.get()) end
                 elseif rw.type == "toggle" then
+                    if rw.disOverlay and rw.disCheck then
+                        local dis
+                        if type(rw.disCheck) == "function" then dis = rw.disCheck() else dis = rw.disCheck end
+                        if dis then rw.disOverlay:Show() else rw.disOverlay:Hide() end
+                    end
+                    if rw.updateVisual then rw.updateVisual() end
+                elseif rw.type == 'togglecolor' then
                     if rw.disOverlay and rw.disCheck then
                         local dis
                         if type(rw.disCheck) == "function" then dis = rw.disCheck() else dis = rw.disCheck end

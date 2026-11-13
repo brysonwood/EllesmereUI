@@ -12,7 +12,13 @@ local GetFriendlyHealthBarWidth = ns.GetFriendlyHealthBarWidth
 
 -- Profile alias: reads from the centralized store via ns.db
 local function FP()
-    return ns.db and ns.db.profile
+    local p = ns.db and ns.db.profile
+    if p and p.nameOnlyStyleNonPlayers ~= nil then
+        if p.nameOnlyStyleFriendlyNPCs == nil then p.nameOnlyStyleFriendlyNPCs = p.nameOnlyStyleNonPlayers end
+        if p.nameOnlyStyleHostileNPCs == nil then p.nameOnlyStyleHostileNPCs = p.nameOnlyStyleNonPlayers end
+        p.nameOnlyStyleNonPlayers = nil
+    end
+    return p
 end
 
 local pairs, ipairs = pairs, ipairs
@@ -68,24 +74,26 @@ local function IsFriendlyNPCEnabled()
     return fp and (fp.showFriendlyNPCs == true)
 end
 
--- Per-unit gate for friendly NPC nameplates. On top of our own toggle: with
--- nameplateForceShowUnitName on (the Forever default; off in retail) Blizzard's
--- plate skips the "NPC Names" filter, so take its UnitFrame's own decision.
--- Otherwise respect the filter via UnitShouldDisplayName(unit): it returns true
--- for the "desired" NPCs the game names (vendors, guards, quest givers, plus the
--- current target/mouseover) and false for flavor NPCs the filter hides. Without
--- this gate our overlay / custom plate would draw a name on NPCs the game
--- intentionally leaves nameless. nil-guarded for safety.
+-- Per-unit gate for friendly NPC nameplates. Respects Blizzard's native interactable filter:
+-- important NPCs (vendors, quest givers, innkeepers, flight masters) always show;
+-- non-interactive flavor NPCs (town guards, ambient citizens) only show when clicked on (targeted)
+-- or hovered over (matching default Blizzard behavior).
 local function IsFriendlyNPCShownForUnit(unit)
     if not IsFriendlyNPCEnabled() then return false end
-    if GetCVarBool("nameplateForceShowUnitName") then
-        local nameplate = C_NamePlate.GetNamePlateForUnit(unit)
-        local uf = nameplate and nameplate.UnitFrame
-        if uf and not uf:IsForbidden() then return uf:ShouldShowName() end
+    if not unit or not UnitExists(unit) then return false end
+
+    -- If targeted or mouseovered, always show
+    if UnitIsUnit(unit, "target") or UnitIsUnit(unit, "mouseover") then
+        return true
     end
-    if unit and UnitShouldDisplayName and not UnitShouldDisplayName(unit) then
+
+    -- Respect Blizzard's native interactable filter:
+    -- UnitShouldDisplayName returns true for interactable NPCs (vendors, quest givers, innkeepers, etc.)
+    -- and false for non-interactable guards / ambient NPCs.
+    if UnitShouldDisplayName and not UnitShouldDisplayName(unit) then
         return false
     end
+
     return true
 end
 
@@ -119,6 +127,19 @@ local function GetNPCTitle(unit)
     -- Filter out level strings (e.g. "Level 70 Humanoid")
     if text:lower():match(LEVEL_PATTERN) then return nil end
     return text
+end
+
+local function IsPetUnit(unit)
+    if not unit or not UnitExists(unit) or UnitIsPlayer(unit) then return false end
+    if UnitPlayerControlled and UnitPlayerControlled(unit) then return true end
+    local title = GetNPCTitle(unit)
+    if title then
+        local t = title:lower()
+        if t:find("pet", 1, true) or t:find("minion", 1, true) or t:find("guardian", 1, true) then
+            return true
+        end
+    end
+    return false
 end
 
 -- Friendly NPC color: #00ff00
@@ -409,34 +430,396 @@ end
 --  UnitFrame (reparent to hidden frame) and render our own name FontString
 --  on the nameplate.  This gives us full control over width, color, and font.
 -------------------------------------------------------------------------------
-local npcOverlays = {}        -- nameplate → overlay frame
+local npcOverlays = {}        -- nameplate -> overlay frame
 local npcOverlayPool = {}     -- recycled overlay frames
+local unitToNameplate = setmetatable({}, { __mode = "v" })
 
-local function GetNPCNameColor(unit)
-    -- UnitReaction: 1-3 = hostile, 4 = neutral, 5+ = friendly
-    local reaction = UnitReaction(unit, "player")
-    if reaction and reaction == 4 then
-        -- Neutral: yellow
-        return 0.9, 0.7, 0.0
+local function GetNamePlateUnitToken(nameplate)
+    if not nameplate then return nil end
+    local u = nameplate.namePlateUnitToken
+    if u and UnitExists(u) then return u end
+    if nameplate.UnitFrame and nameplate.UnitFrame.unit and UnitExists(nameplate.UnitFrame.unit) then
+        return nameplate.UnitFrame.unit
     end
-    local fp = FP()
-    local c = (fp and fp.friendlyNPCNameColor) or ns.defaults.friendlyNPCNameColor
-    return c.r, c.g, c.b
+    for unitToken, plate in pairs(unitToNameplate) do
+        if plate == nameplate and UnitExists(unitToken) then
+            return unitToken
+        end
+    end
+    return nil
 end
 
--- Title line under the name-only NPC name. Independent of the name color; the
--- default alpha is what separates it from the name above it. Neutral units
--- mirror GetNPCNameColor: reaction yellow wins over the stored color (the
--- swatch governs friendly units only, same as Name Color), alpha stays the
--- stored one.
+-------------------------------------------------------------------------------
+--  Target Name Colors for Name-Only Mode
+-------------------------------------------------------------------------------
+local recentGroupPlayers = {} -- guid -> timestamp
+
+local function UpdateRecentGroupMembers()
+    if not IsInGroup or not IsInGroup() then return end
+    local n = (GetNumGroupMembers and GetNumGroupMembers()) or 0
+    local isRaid = IsInRaid and IsInRaid()
+    local prefix = isRaid and "raid" or "party"
+    local count = isRaid and n or (n - 1)
+    for i = 1, count do
+        local u = prefix .. i
+        local g = UnitGUID and UnitGUID(u)
+        if g and g ~= "" and not (UnitIsUnit and UnitIsUnit(u, "player")) then
+            recentGroupPlayers[g] = GetTime and GetTime() or true
+        end
+    end
+end
+
+local function IsUnitFriend(unit)
+    if not unit or not UnitIsPlayer(unit) then return false end
+    local guid = UnitGUID and UnitGUID(unit)
+    if not guid or guid == "" then return false end
+    if C_BattleNet and C_BattleNet.GetGameAccountInfoByGUID then
+        if C_BattleNet.GetGameAccountInfoByGUID(guid) then return true end
+    end
+    if C_FriendList and C_FriendList.IsFriend then
+        if C_FriendList.IsFriend(guid) then return true end
+    end
+    return false
+end
+
+local function IsUnitRecent(unit)
+    if not unit or not UnitIsPlayer(unit) then return false end
+    local guid = UnitGUID and UnitGUID(unit)
+    if not guid or not recentGroupPlayers[guid] then return false end
+    if (UnitPlayerOrPetInParty and UnitPlayerOrPetInParty(unit)) or (UnitPlayerOrPetInRaid and UnitPlayerOrPetInRaid(unit)) then
+        return false
+    end
+    return true
+end
+
+ns.NAME_ONLY_TARGETS = {
+    -- Section 1: Player Relationships
+    { key = "FRIENDLY_PLAYER_FRIEND", label = "Friends (BNet & Character)", sec = 1,
+      tip = "Highlights players on your Battle.net or character Friends list.\n\nWhen disabled, falls back to your base color.",
+      defColor = { r = 1.00, g = 0.84, b = 0.00 } },
+    { key = "FRIENDLY_PLAYER_RECENT", label = "Recently Played With", sec = 1,
+      tip = "Highlights players who were in your party or raid earlier this session, but are no longer in your group.\n\nWhen disabled, falls back to your base color.",
+      defColor = { r = 0.70, g = 0.53, b = 1.00 } },
+    { key = "FRIENDLY_PARTY_RAID", label = "Party & Raid Members", sec = 1,
+      tip = "Highlights players in your current party or raid group.\n\nWhen disabled, falls back to your base color.",
+      defColor = { r = 0.616, g = 0.651, b = 1.00 } },
+    { key = "FRIENDLY_GUILD", label = "Guild Members", sec = 1,
+      tip = "Highlights players in your guild.\n\nWhen disabled, falls back to your base color.",
+      defColor = { r = 0.25, g = 0.88, b = 0.55 } },
+    { key = "FRIENDLY_PLAYER_UNFLAGGED", label = "Unflagged Players", sec = 1,
+      tip = "Highlights friendly players who are not PvP flagged.\n\nWhen disabled, falls back to your base color.",
+      defColor = { r = 0.467, g = 0.533, b = 1.00 } },
+    { key = "FRIENDLY_PLAYER_PVP", label = "PvP Flagged Players", sec = 1,
+      tip = "Highlights friendly players flagged for PvP.\n\nWhen disabled, falls back to your base color.",
+      defColor = { r = 0.00, g = 1.00, b = 0.00 } },
+    { key = "ENEMY_PLAYER_DUEL", label = "Dueling Opponents", sec = 1,
+      tip = "Highlights friendly players currently dueling you.\n\nWhen disabled, falls back to your base color.",
+      defColor = { r = 1.00, g = 0.25, b = 0.25 } },
+
+    -- Section 2: Friendly & Neutral NPCs
+    { key = "FRIENDLY_NPC_CIVILIAN", label = "Civilian NPCs", sec = 2,
+      tip = "Friendly civilian NPCs (vendors, quest givers, citizens).\n\nWhen disabled, uses friendly reaction green.",
+      defColor = { r = 0.00, g = 1.00, b = 0.00 } },
+    { key = "FRIENDLY_NPC_STANDARD", label = "Standard NPCs", sec = 2,
+      tip = "Standard friendly NPCs (guards, non-civilians).\n\nWhen disabled, uses friendly reaction green.",
+      defColor = { r = 0.00, g = 1.00, b = 0.00 } },
+    { key = "FRIENDLY_NPC_ESCORT", label = "Escort NPCs (In Combat)", sec = 2,
+      tip = "Friendly NPCs engaged in combat (escort quest objectives).\n\nWhen disabled, uses friendly reaction green.",
+      defColor = { r = 0.00, g = 1.00, b = 0.00 } },
+    { key = "NEUTRAL_NPC_PASSIVE", label = "Passive Neutral NPCs", sec = 2,
+      tip = "Non-aggressive neutral NPCs (yellow reaction).\n\nWhen disabled, uses neutral reaction yellow.",
+      defColor = { r = 1.00, g = 1.00, b = 0.00 } },
+    { key = "PET_MINION_FRIENDLY", label = "Player Pets & Minions", sec = 2,
+      tip = "Player-controlled friendly pets and minions.\n\nWhen disabled, uses owner's flagged or unflagged color.",
+      defColor = { r = 0.467, g = 0.533, b = 1.00 } },
+    { key = "PET_MINION_NPC_FRIENDLY", label = "Friendly NPC Pets & Guardians", sec = 2,
+      tip = "Friendly NPC pets, guardians, and companions.\n\nWhen disabled, uses friendly reaction green.",
+      defColor = { r = 0.00, g = 1.00, b = 0.00 } },
+
+    -- Section 3: Opposing Faction NPCs & Pets
+    { key = "HOSTILE_NPC_STANDARD", label = "Opposing Faction NPCs", sec = 3,
+      tip = "Opposing faction and unfriendly NPCs.\n\nWhen disabled, uses reaction orange.",
+      defColor = { r = 0.949, g = 0.549, b = 0.098 } },
+    { key = "HOSTILE_NPC_TAPPED", label = "Tapped NPCs (Grey)", sec = 3,
+      tip = "NPCs tapped by another player (no credit/loot).\n\nWhen disabled, uses desaturated grey.",
+      defColor = { r = 0.55, g = 0.55, b = 0.55 } },
+    { key = "PET_MINION_HOSTILE", label = "Opposing NPC Pets & Minions", sec = 3,
+      tip = "Opposing faction NPC pets and minions.\n\nWhen disabled, matches owner's reaction color.",
+      defColor = { r = 0.949, g = 0.549, b = 0.098 } },
+}
+
+local function GetActiveHighlightColor(unit, fp)
+    if not unit or not UnitExists(unit) then return nil end
+
+    local stylePlayers = fp and (fp.nameOnlyStylePlayerRelationships == true)
+    local styleFriendly = fp and (fp.nameOnlyStyleFriendlyNPCs == true)
+    local styleHostile = fp and (fp.nameOnlyStyleHostileNPCs == true)
+
+    -- 1. Players (Gated on Style Player Relationships master toggle)
+    if UnitIsPlayer(unit) then
+        if stylePlayers then
+            if UnitCanAttack("player", unit) and fp.nameOnlyCustomEnabled_ENEMY_PLAYER_DUEL then
+                local c = fp.nameOnlyCustomColor_ENEMY_PLAYER_DUEL or (ns.defaults and ns.defaults.nameOnlyCustomColor_ENEMY_PLAYER_DUEL)
+                if c then return c.r, c.g, c.b end
+            end
+            if UnitIsFriend("player", unit) then
+                if fp.nameOnlyCustomEnabled_FRIENDLY_PLAYER_FRIEND and IsUnitFriend(unit) then
+                    local c = fp.nameOnlyCustomColor_FRIENDLY_PLAYER_FRIEND or (ns.defaults and ns.defaults.nameOnlyCustomColor_FRIENDLY_PLAYER_FRIEND)
+                    if c then return c.r, c.g, c.b end
+                end
+                if fp.nameOnlyCustomEnabled_FRIENDLY_PARTY_RAID and ((UnitPlayerOrPetInParty and UnitPlayerOrPetInParty(unit)) or (UnitPlayerOrPetInRaid and UnitPlayerOrPetInRaid(unit))) then
+                    local c = fp.nameOnlyCustomColor_FRIENDLY_PARTY_RAID or (ns.defaults and ns.defaults.nameOnlyCustomColor_FRIENDLY_PARTY_RAID)
+                    if c then return c.r, c.g, c.b end
+                end
+                if fp.nameOnlyCustomEnabled_FRIENDLY_PLAYER_RECENT and IsUnitRecent(unit) then
+                    local c = fp.nameOnlyCustomColor_FRIENDLY_PLAYER_RECENT or (ns.defaults and ns.defaults.nameOnlyCustomColor_FRIENDLY_PLAYER_RECENT)
+                    if c then return c.r, c.g, c.b end
+                end
+                if fp.nameOnlyCustomEnabled_FRIENDLY_GUILD and UnitIsInMyGuild and UnitIsInMyGuild(unit) then
+                    local c = fp.nameOnlyCustomColor_FRIENDLY_GUILD or (ns.defaults and ns.defaults.nameOnlyCustomColor_FRIENDLY_GUILD)
+                    if c then return c.r, c.g, c.b end
+                end
+                if fp.nameOnlyCustomEnabled_FRIENDLY_PLAYER_PVP and UnitIsPVP and UnitIsPVP(unit) then
+                    local c = fp.nameOnlyCustomColor_FRIENDLY_PLAYER_PVP or (ns.defaults and ns.defaults.nameOnlyCustomColor_FRIENDLY_PLAYER_PVP)
+                    if c then return c.r, c.g, c.b end
+                end
+                if fp.nameOnlyCustomEnabled_FRIENDLY_PLAYER_UNFLAGGED and not (UnitIsPVP and UnitIsPVP(unit)) then
+                    local c = fp.nameOnlyCustomColor_FRIENDLY_PLAYER_UNFLAGGED or (ns.defaults and ns.defaults.nameOnlyCustomColor_FRIENDLY_PLAYER_UNFLAGGED)
+                    if c then return c.r, c.g, c.b end
+                end
+            end
+        end
+        return nil  -- Unit is a player; never fall through to NPC sections
+    end
+
+    -- 2. Friendly & Neutral NPCs (Only when Style Friendly & Neutral Units is enabled)
+    if styleFriendly and not UnitIsPlayer(unit) then
+        local reaction = UnitReaction and UnitReaction(unit, "player")
+        local inCombat = UnitAffectingCombat and UnitAffectingCombat(unit)
+
+        if reaction and reaction >= 5 then
+            if inCombat and fp.nameOnlyCustomEnabled_FRIENDLY_NPC_ESCORT then
+                local c = fp.nameOnlyCustomColor_FRIENDLY_NPC_ESCORT or (ns.defaults and ns.defaults.nameOnlyCustomColor_FRIENDLY_NPC_ESCORT)
+                if c then return c.r, c.g, c.b end
+            end
+            local isCiv = UnitIsCivilian and UnitIsCivilian(unit)
+            if isCiv then
+                if fp.nameOnlyCustomEnabled_FRIENDLY_NPC_CIVILIAN then
+                    local c = fp.nameOnlyCustomColor_FRIENDLY_NPC_CIVILIAN or (ns.defaults and ns.defaults.nameOnlyCustomColor_FRIENDLY_NPC_CIVILIAN)
+                    if c then return c.r, c.g, c.b end
+                end
+            else
+                if fp.nameOnlyCustomEnabled_FRIENDLY_NPC_STANDARD then
+                    local c = fp.nameOnlyCustomColor_FRIENDLY_NPC_STANDARD or (ns.defaults and ns.defaults.nameOnlyCustomColor_FRIENDLY_NPC_STANDARD)
+                    if c then return c.r, c.g, c.b end
+                end
+            end
+        end
+
+        if reaction and reaction == 4 then
+            if fp.nameOnlyCustomEnabled_NEUTRAL_NPC_PASSIVE then
+                local c = fp.nameOnlyCustomColor_NEUTRAL_NPC_PASSIVE or (ns.defaults and ns.defaults.nameOnlyCustomColor_NEUTRAL_NPC_PASSIVE)
+                if c then return c.r, c.g, c.b end
+            end
+        end
+    end
+
+    -- 3. Opposing Faction NPCs (Only when Style Opposing Faction Units is enabled)
+    if styleHostile and not UnitIsPlayer(unit) then
+        local reaction = UnitReaction and UnitReaction(unit, "player")
+        if UnitIsTapDenied and UnitIsTapDenied(unit) then
+            if fp.nameOnlyCustomEnabled_HOSTILE_NPC_TAPPED then
+                local c = fp.nameOnlyCustomColor_HOSTILE_NPC_TAPPED or (ns.defaults and ns.defaults.nameOnlyCustomColor_HOSTILE_NPC_TAPPED)
+                if c then return c.r, c.g, c.b end
+            end
+        elseif reaction and reaction <= 3 then
+            if fp.nameOnlyCustomEnabled_HOSTILE_NPC_STANDARD then
+                local c = fp.nameOnlyCustomColor_HOSTILE_NPC_STANDARD or (ns.defaults and ns.defaults.nameOnlyCustomColor_HOSTILE_NPC_STANDARD)
+                if c then return c.r, c.g, c.b end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function GetPetColor(unit, fp)
+    local isEnemy = UnitCanAttack and UnitCanAttack("player", unit)
+    local isPlayerPet = UnitPlayerControlled and UnitPlayerControlled(unit)
+    local reaction = unit and UnitReaction and UnitReaction(unit, "player")
+
+    if isEnemy and reaction and reaction <= 3 then
+        -- Opposing / Hostile pet / minion
+        if fp.nameOnlyStyleHostileNPCs == true and fp.nameOnlyCustomEnabled_PET_MINION_HOSTILE then
+            local c = fp.nameOnlyCustomColor_PET_MINION_HOSTILE or (ns.defaults and ns.defaults.nameOnlyCustomColor_PET_MINION_HOSTILE)
+            if c then return c.r, c.g, c.b, true end
+        end
+        -- When disabled, matches owner reaction color (Opposing Faction custom color if enabled, else default orange)
+        if fp.nameOnlyStyleHostileNPCs == true and fp.nameOnlyCustomEnabled_HOSTILE_NPC_STANDARD then
+            local c = fp.nameOnlyCustomColor_HOSTILE_NPC_STANDARD or (ns.defaults and ns.defaults.nameOnlyCustomColor_HOSTILE_NPC_STANDARD)
+            if c then return c.r, c.g, c.b, false end
+        end
+        return 0.949, 0.549, 0.098, false
+    elseif reaction and reaction == 4 then
+        -- Neutral NPC pet / minion
+        if fp.nameOnlyStyleFriendlyNPCs == true and fp.nameOnlyCustomEnabled_NEUTRAL_NPC_PASSIVE then
+            local c = fp.nameOnlyCustomColor_NEUTRAL_NPC_PASSIVE or (ns.defaults and ns.defaults.nameOnlyCustomColor_NEUTRAL_NPC_PASSIVE)
+            if c then return c.r, c.g, c.b, true end
+        end
+        return 1.00, 1.00, 0.00, false
+    else
+        -- Friendly pet / minion
+        if isPlayerPet then
+            -- Player-controlled pet / minion
+            if fp.nameOnlyStyleFriendlyNPCs == true and fp.nameOnlyCustomEnabled_PET_MINION_FRIENDLY then
+                local c = fp.nameOnlyCustomColor_PET_MINION_FRIENDLY or (ns.defaults and ns.defaults.nameOnlyCustomColor_PET_MINION_FRIENDLY)
+                if c then return c.r, c.g, c.b, true end
+            end
+            -- Inherit owner's flagged vs unflagged color
+            local isPVP = UnitIsPVP and UnitIsPVP(unit)
+            if isPVP then
+                if fp.nameOnlyStylePlayerRelationships == true and fp.nameOnlyCustomEnabled_FRIENDLY_PLAYER_PVP then
+                    local c = fp.nameOnlyCustomColor_FRIENDLY_PLAYER_PVP or (ns.defaults and ns.defaults.nameOnlyCustomColor_FRIENDLY_PLAYER_PVP)
+                    if c then return c.r, c.g, c.b, false end
+                end
+                return 0.00, 1.00, 0.00, false
+            else
+                if fp.nameOnlyStylePlayerRelationships == true and fp.nameOnlyCustomEnabled_FRIENDLY_PLAYER_UNFLAGGED then
+                    local c = fp.nameOnlyCustomColor_FRIENDLY_PLAYER_UNFLAGGED or (ns.defaults and ns.defaults.nameOnlyCustomColor_FRIENDLY_PLAYER_UNFLAGGED)
+                    if c then return c.r, c.g, c.b, false end
+                end
+                return 0.467, 0.533, 1.00, false
+            end
+        else
+            -- NPC-controlled pet / guardian / minion
+            if fp.nameOnlyStyleFriendlyNPCs == true and fp.nameOnlyCustomEnabled_PET_MINION_NPC_FRIENDLY then
+                local c = fp.nameOnlyCustomColor_PET_MINION_NPC_FRIENDLY or (ns.defaults and ns.defaults.nameOnlyCustomColor_PET_MINION_NPC_FRIENDLY)
+                if c then return c.r, c.g, c.b, true end
+            end
+            -- When disabled, matches owner reaction color (Standard NPC custom color if enabled, else default green)
+            if fp.nameOnlyStyleFriendlyNPCs == true and fp.nameOnlyCustomEnabled_FRIENDLY_NPC_STANDARD then
+                local c = fp.nameOnlyCustomColor_FRIENDLY_NPC_STANDARD or (ns.defaults and ns.defaults.nameOnlyCustomColor_FRIENDLY_NPC_STANDARD)
+                if c then return c.r, c.g, c.b, false end
+            end
+            local c = fp.friendlyNPCNameColor or (ns.defaults and ns.defaults.friendlyNPCNameColor)
+            if c then return c.r, c.g, c.b, false end
+            return 0.00, 1.00, 0.00, false
+        end
+    end
+end
+
+-------------------------------------------------------------------------------
+--  Class colours: the friendly bar, the name and the guild line
+-------------------------------------------------------------------------------
+-- The unit's class colour on the suite palette (custom class colours and Class
+-- Color Darken). Returns ok, r, g, b. A redacted class token takes the
+-- restricted-unit palette, else Blizzard's class colour; those r/g/b may be
+-- secret, so they only ever reach a setter. plainOnly refuses a redacted token
+-- instead, for callers that need numbers they can do arithmetic on.
+local function ClassRGB(unit, plainOnly)
+    local _, tok = UnitClass(unit)
+    if issecretvalue(tok) then
+        if plainOnly then return false end
+        local ok, r, g, b = EllesmereUI.GetClassColorForRestrictedUnit(unit, tok)
+        if ok then return true, r, g, b end
+        local c = C_ClassColor.GetClassColor(tok)
+        if c then return true, c:GetRGB() end
+        return false
+    end
+    if not tok then return false end
+    local c = EllesmereUI.GetClassColor(tok)
+    return true, c.r, c.g, c.b
+end
+
+function ns.GetNameOnlyUnitColor(unit)
+    local fp = FP()
+    if not fp then return 1, 1, 1, false end
+
+    -- Check if unit is a pet
+    if IsPetUnit(unit) then
+        local pr, pg, pb, isOv = GetPetColor(unit, fp)
+        return pr, pg, pb, isOv
+    end
+
+    -- Check if any priority highlight is enabled
+    local hr, hg, hb = GetActiveHighlightColor(unit, fp)
+    if hr then
+        return hr, hg, hb, true
+    end
+
+    -- Base Look fallback
+    if UnitIsPlayer(unit) then
+        local useClass = fp.classColorFriendly ~= false
+        if useClass then
+            local ok, r, g, b = ClassRGB(unit)
+            if ok then return r, g, b, false end
+            return 1, 1, 1, false
+        else
+            local c = fp.friendlyNameCustomColor or (ns.defaults and ns.defaults.friendlyNameCustomColor)
+            if c then return c.r, c.g, c.b, true end
+            return 1, 1, 1, true
+        end
+    else
+        local reaction = UnitReaction and UnitReaction(unit, "player")
+        if reaction and reaction <= 3 then
+            if UnitIsTapDenied and UnitIsTapDenied(unit) then
+                return 0.55, 0.55, 0.55, false
+            end
+            return 0.949, 0.549, 0.098, false
+        elseif reaction and reaction == 4 then
+            return 1.00, 1.00, 0.00, false
+        else
+            local c = fp.friendlyNPCNameColor or (ns.defaults and ns.defaults.friendlyNPCNameColor)
+            if c then return c.r, c.g, c.b, false end
+            return 0.00, 1.00, 0.00, false
+        end
+    end
+end
+
+local function GetNPCNameColor(unit)
+    local fp = FP()
+    if not fp then return 0.00, 1.00, 0.00 end
+
+    local isPet = IsPetUnit(unit)
+    if isPet then
+        local r, g, b = GetPetColor(unit, fp)
+        return r, g, b
+    end
+
+    local isEnemy = UnitCanAttack and UnitCanAttack("player", unit)
+    local styleEnabled
+    if isEnemy then
+        styleEnabled = (fp.nameOnlyStyleHostileNPCs == true)
+    else
+        styleEnabled = (fp.nameOnlyStyleFriendlyNPCs == true)
+    end
+
+    if styleEnabled then
+        local r, g, b = ns.GetNameOnlyUnitColor(unit)
+        return r, g, b
+    end
+
+    -- Prior default behavior: reaction yellow for neutral, friendly green for friendly, orange for opposing faction
+    local reaction = unit and UnitReaction and UnitReaction(unit, "player")
+    if reaction and reaction <= 3 then
+        return 0.949, 0.549, 0.098
+    elseif reaction and reaction == 4 then
+        return 1.00, 1.00, 0.00
+    else
+        local c = fp.friendlyNPCNameColor or (ns.defaults and ns.defaults.friendlyNPCNameColor)
+        if c then return c.r, c.g, c.b end
+        return 0.00, 1.00, 0.00
+    end
+end
+
+-- Title line under the name-only NPC name. Inherits the NPC name color (just as pet owner
+-- subtitle matches pet name, and player guild matches player name); the configured alpha
+-- separates it from the name above it.
 local function GetNPCTitleColor(unit)
     local fp = FP()
-    local c = (fp and fp.friendlyNPCTitleColor) or ns.defaults.friendlyNPCTitleColor
-    local reaction = unit and UnitReaction(unit, "player")
-    if reaction and reaction == 4 then
-        return 0.9, 0.7, 0.0, c.a or 1
-    end
-    return c.r, c.g, c.b, c.a or 1
+    local c = (fp and fp.friendlyNPCTitleColor) or (ns.defaults and ns.defaults.friendlyNPCTitleColor)
+    local r, g, b = GetNPCNameColor(unit)
+    return r, g, b, (c and c.a) or 1
 end
 
 local NPC_TITLE_FONT_SIZE = 10
@@ -504,15 +887,22 @@ local NPC_OVERLAY_FONT_SIZE = 13
 local NPC_OVERLAY_Y_OFFSET = 5  -- positive = lower on screen (closer to character)
 local NPC_OVERLAY_WIDTH = 126   -- word-wrap width
 
--- User-configurable size for the friendly NPC name-only overlay name text.
--- Defaults to NPC_OVERLAY_FONT_SIZE.
-local function GetNPCOverlayNameSize()
+-- User-configurable size for friendly NPC and pet name-only overlay text.
+local function GetOverlayNameSize(unit)
     local fp = FP()
+    local isPet = IsPetUnit(unit)
+    if isPet then
+        return (fp and fp.friendlyPetNameSize) or NPC_OVERLAY_FONT_SIZE
+    end
     return (fp and fp.friendlyNPCNameSize) or NPC_OVERLAY_FONT_SIZE
 end
 
-local function GetNPCTitleSize()
+local function GetNPCTitleSize(unit)
     local fp = FP()
+    local isPet = unit and IsPetUnit(unit)
+    if isPet then
+        return (fp and fp.friendlyPetTitleSize) or 10
+    end
     return (fp and fp.friendlyNPCTitleSize) or NPC_TITLE_FONT_SIZE
 end
 
@@ -521,8 +911,8 @@ end
 -- lines are font families (AcquireOverlay's first font is one), so every font
 -- write here goes through SetFontFamily too.
 local function ApplyOverlayStyle(overlay, unit)
-    local font, outline, shadow = GetFont(), GetNPOutline(), GetNPUseShadow()
-    EllesmereUI.SetFontFamily(overlay.name, font, GetNPCOverlayNameSize(), outline, shadow)
+    local font, outline, shadow = GetFont(), "OUTLINE", GetNPUseShadow()
+    EllesmereUI.SetFontFamily(overlay.name, font, GetOverlayNameSize(unit), outline, shadow)
     overlay.name:SetTextColor(GetNPCNameColor(unit))
     if overlay.name.SetSnapToPixelGrid then
         overlay.name:SetSnapToPixelGrid(false)
@@ -530,7 +920,7 @@ local function ApplyOverlayStyle(overlay, unit)
     if overlay.name.SetTexelSnappingBias then
         overlay.name:SetTexelSnappingBias(0)
     end
-    EllesmereUI.SetFontFamily(overlay.title, font, GetNPCTitleSize(), outline, shadow)
+    EllesmereUI.SetFontFamily(overlay.title, font, GetNPCTitleSize(unit), outline, shadow)
     overlay.title:SetTextColor(GetNPCTitleColor(unit))
 end
 
@@ -544,8 +934,37 @@ local function FormatNPCName(name)
 end
 
 local function ShowNPCOverlay(nameplate, unit)
-    if npcOverlays[nameplate] then return end
-    local overlay = AcquireOverlay()
+    local overlay = npcOverlays[nameplate]
+    if overlay then
+        overlay:Show()
+        if overlay:GetParent() ~= nameplate then
+            overlay:SetParent(nameplate)
+            overlay:ClearAllPoints()
+            overlay:SetPoint("CENTER", nameplate, "CENTER", 0, -NPC_OVERLAY_Y_OFFSET)
+            overlay:SetFrameLevel(nameplate:GetFrameLevel() + 5)
+        end
+        if overlay.unit ~= unit or overlay.name:GetText() == "" then
+            overlay.unit = unit
+            local unitName = FormatNPCName(UnitName(unit) or "")
+            overlay.name:SetText(unitName)
+            ApplyOverlayStyle(overlay, unit)
+            if ShowNPCTitles() then
+                local titleText = GetNPCTitle(unit)
+                if titleText then
+                    overlay.title:SetText("<" .. titleText .. ">")
+                    overlay.title:Show()
+                else
+                    overlay.title:Hide()
+                end
+            else
+                overlay.title:Hide()
+            end
+        else
+            ApplyOverlayStyle(overlay, unit)
+        end
+        return
+    end
+    overlay = AcquireOverlay()
     overlay:SetParent(nameplate)
     overlay:ClearAllPoints()
     overlay:SetPoint("CENTER", nameplate, "CENTER", 0, -NPC_OVERLAY_Y_OFFSET)
@@ -576,14 +995,27 @@ local function ShowNPCOverlay(nameplate, unit)
         UpdateOverlayRaidIcon(overlay)
         overlay:RegisterEvent("RAID_TARGET_UPDATE")
     end
-    -- Listen for name updates (server may not have sent the name yet)
-    overlay:RegisterUnitEvent("UNIT_NAME_UPDATE", unit)
+    -- Listen for name updates (server may not have sent the name yet), combat, and faction changes
+    if unit ~= "target" and unit ~= "mouseover" then
+        overlay:RegisterUnitEvent("UNIT_NAME_UPDATE", unit)
+        overlay:RegisterUnitEvent("UNIT_FLAGS", unit)
+        overlay:RegisterUnitEvent("UNIT_FACTION", unit)
+    else
+        local token = GetNamePlateUnitToken(nameplate)
+        if token and token ~= "target" and token ~= "mouseover" then
+            overlay:RegisterUnitEvent("UNIT_NAME_UPDATE", token)
+            overlay:RegisterUnitEvent("UNIT_FLAGS", token)
+            overlay:RegisterUnitEvent("UNIT_FACTION", token)
+        end
+    end
     overlay:SetScript("OnEvent", function(self, event, ...)
         if event == "UNIT_NAME_UPDATE" then
             local updatedName = FormatNPCName(UnitName(self.unit) or "")
             self.name:SetText(updatedName)
         elseif event == "RAID_TARGET_UPDATE" then
             UpdateOverlayRaidIcon(self)
+        elseif event == "UNIT_FLAGS" or event == "UNIT_FACTION" then
+            if self.unit then ApplyOverlayStyle(self, self.unit) end
         end
     end)
     npcOverlays[nameplate] = overlay
@@ -594,7 +1026,9 @@ local function HideNPCOverlay(nameplate)
     if not overlay then return end
     overlay:UnregisterAllEvents()
     overlay:Hide()
+    overlay.name:SetText("")
     overlay.title:Hide()
+    overlay.title:SetText("")
     if overlay.raid then overlay.raid:Hide() end
     overlay:SetParent(UIParent)
     overlay:ClearAllPoints()
@@ -627,28 +1061,88 @@ function ns.RefreshNPCOverlayStyle()
     end
 end
 
--------------------------------------------------------------------------------
---  Class colours: the friendly bar, the name and the guild line
--------------------------------------------------------------------------------
--- The unit's class colour on the suite palette (custom class colours and Class
--- Color Darken). Returns ok, r, g, b. A redacted class token takes the
--- restricted-unit palette, else Blizzard's class colour; those r/g/b may be
--- secret, so they only ever reach a setter. plainOnly refuses a redacted token
--- instead, for callers that need numbers they can do arithmetic on.
-local function ClassRGB(unit, plainOnly)
-    local _, tok = UnitClass(unit)
-    if issecretvalue(tok) then
-        if plainOnly then return false end
-        local ok, r, g, b = EllesmereUI.GetClassColorForRestrictedUnit(unit, tok)
-        if ok then return true, r, g, b end
-        local c = C_ClassColor.GetClassColor(tok)
-        if c then return true, c:GetRGB() end
-        return false
+local function UpdateNPCOverlayVisibility(nameplate, unit)
+    if not nameplate or not unit then return end
+    if not IsNameOnlyMode() or UnitIsPlayer(unit) then return end
+
+    local isPet = IsPetUnit(unit)
+    local fp = FP()
+    local isEnemy = UnitCanAttack and UnitCanAttack("player", unit)
+    local showPet
+    if isEnemy then
+        showPet = isPet and (fp and fp.showEnemyPets == true)
+    else
+        showPet = isPet and (fp and fp.showFriendlyPets == true)
     end
-    if not tok then return false end
-    local c = EllesmereUI.GetClassColor(tok)
-    return true, c.r, c.g, c.b
+    local showNPC = not isPet and (fp and fp.showFriendlyNPCs == true)
+
+    if (showPet and isPet) or (showNPC and IsFriendlyNPCShownForUnit(unit)) then
+        ShowNPCOverlay(nameplate, unit)
+    else
+        HideNPCOverlay(nameplate)
+    end
 end
+ns.UpdateNPCOverlayVisibility = UpdateNPCOverlayVisibility
+
+local function OnTargetChangedNPCOverlays()
+    if not IsNameOnlyMode() then return end
+
+    -- 0. Check all currently active overlays in npcOverlays
+    for nameplate, overlay in pairs(npcOverlays) do
+        local u = overlay.unit or GetNamePlateUnitToken(nameplate)
+        if u and UnitExists(u) and not UnitCanAttack("player", u) and not UnitIsPlayer(u) then
+            UpdateNPCOverlayVisibility(nameplate, u)
+        elseif not u or not UnitExists(u) then
+            HideNPCOverlay(nameplate)
+        end
+    end
+
+    -- 1. Direct check on current target if friendly/neutral non-player
+    if UnitExists("target") and not UnitCanAttack("player", "target") and not UnitIsPlayer("target") then
+        local targetPlate = C_NamePlate.GetNamePlateForUnit and C_NamePlate.GetNamePlateForUnit("target")
+        if targetPlate then
+            UpdateNPCOverlayVisibility(targetPlate, "target")
+        end
+    end
+
+    -- 2. Direct check on mouseover if friendly/neutral non-player
+    if UnitExists("mouseover") and not UnitCanAttack("player", "mouseover") and not UnitIsPlayer("mouseover") then
+        local moPlate = C_NamePlate.GetNamePlateForUnit and C_NamePlate.GetNamePlateForUnit("mouseover")
+        if moPlate then
+            UpdateNPCOverlayVisibility(moPlate, "mouseover")
+        end
+    end
+
+    -- 3. Walk all registered unitToNameplate mappings
+    for u, np in pairs(unitToNameplate) do
+        if np and UnitExists(u) and not UnitCanAttack("player", u) and not UnitIsPlayer(u) then
+            UpdateNPCOverlayVisibility(np, u)
+        end
+    end
+
+    -- 4. Walk nameplate1 .. nameplate40
+    for i = 1, 40 do
+        local token = "nameplate" .. i
+        if UnitExists(token) and not UnitCanAttack("player", token) and not UnitIsPlayer(token) then
+            local np = C_NamePlate.GetNamePlateForUnit and C_NamePlate.GetNamePlateForUnit(token)
+            if np then
+                UpdateNPCOverlayVisibility(np, token)
+            end
+        end
+    end
+
+    -- 5. Sweep all plates from C_NamePlate.GetNamePlates()
+    local allPlates = C_NamePlate.GetNamePlates and C_NamePlate.GetNamePlates()
+    if allPlates then
+        for _, nameplate in ipairs(allPlates) do
+            local u = GetNamePlateUnitToken(nameplate)
+            if u and not UnitCanAttack("player", u) and not UnitIsPlayer(u) then
+                UpdateNPCOverlayVisibility(nameplate, u)
+            end
+        end
+    end
+end
+ns.OnTargetChangedNPCOverlays = OnTargetChangedNPCOverlays
 
 -- Paints one full plate's bar and name. Players: the bar takes the class colour
 -- (Class Colored Health Bar) or friendlyBarColor, the name the class colour
@@ -690,11 +1184,23 @@ end
 -------------------------------------------------------------------------------
 local SUB_TEXT_R, SUB_TEXT_G, SUB_TEXT_B = 0.8, 0.8, 0.8
 
--- Effective sub text color: the unit's class color when Class Colored is
--- picked (a secret class token falls back to custom: name-only mode builds a
--- colour escape from these numbers), else the custom color.
+-- Effective sub text color: the player's name color when Match Player Name Color
+-- is picked (returns the name-only color or full-plate class/white), else class color
+-- when Class Colored is picked, else the custom color.
 local function GetSubTextColor(unit)
     local fp = FP()
+    if fp and fp.friendlyBelowNameMatchNameColor then
+        if IsNameOnlyMode() then
+            local r, g, b = ns.GetNameOnlyUnitColor(unit)
+            return r, g, b
+        else
+            if fp.friendlyNameClassColor then
+                local ok, r, g, b = ClassRGB(unit, true)
+                if ok then return r, g, b end
+            end
+            return 1, 1, 1
+        end
+    end
     if fp and fp.friendlyBelowNameClassColor then
         local ok, r, g, b = ClassRGB(unit, true)
         if ok then return r, g, b end
@@ -847,12 +1353,13 @@ do
         titledCount[mode] = titledCount[mode] + 1
         return s
     end
-    local aFormat, aMode, aBrackets, aLevel, aDiff, aGroupBrackets, stamped
+    local aFormat, aMode, aBrackets, aMatch, aLevel, aDiff, aGroupBrackets, stamped
     StampFriendlyNames = function()
         local fp = FP()
         if not fp then return end
         aFormat, aMode = fp.friendlyNameFormat, fp.friendlyBelowName or "none"
         aBrackets, stamped = fp.friendlyBelowNameGuildBrackets ~= false, true
+        aMatch = fp.friendlyBelowNameMatchNameColor == true
         aLevel, aDiff = fp.friendlyShowLevel == true, fp.friendlyLevelDiffColor == true
         aGroupBrackets = fp.friendlyGroupBrackets == true
     end
@@ -864,6 +1371,7 @@ do
         if not stamped then StampFriendlyNames(); return end
         if fp.friendlyNameFormat == aFormat and (fp.friendlyBelowName or "none") == aMode
             and (fp.friendlyBelowNameGuildBrackets ~= false) == aBrackets
+            and (fp.friendlyBelowNameMatchNameColor == true) == aMatch
             and (fp.friendlyShowLevel == true) == aLevel
             and (fp.friendlyLevelDiffColor == true) == aDiff
             and (fp.friendlyGroupBrackets == true) == aGroupBrackets then
@@ -930,6 +1438,7 @@ local function UpdateNameOnlyText(nameFS)
         nameFSUnits[nameFS], nameFSText[nameFS] = nil, nil
         return
     end
+    if not UnitIsPlayer(unit) then return end
     -- Nameplate tokens are recycled: a plate reused for an enemy keeps our
     -- hook and a stale friendly token, so never write on a hostile unit
     -- (Blizzard's own name write is already correct there).
@@ -968,10 +1477,19 @@ local function UpdateNameOnlyText(nameFS)
     -- touching a secret with ==.
     local guildKey = guild
     if guildKey ~= nil and issecretvalue and issecretvalue(guildKey) then guildKey = true end
+
+    local cr, cg, cb, isCustom = ns.GetNameOnlyUnitColor(unit)
+    local colorKey = isCustom and string.format("%02x%02x%02x", math.floor(cr * 255 + 0.5), math.floor(cg * 255 + 0.5), math.floor(cb * 255 + 0.5)) or "c"
+
     local st = nameFSText[nameFS]
-    if st and st.name == want and st.guild == guildKey then return end
+    if st and st.name == want and st.guild == guildKey and st.color == colorKey then return end
     if not st then st = {}; nameFSText[nameFS] = st end
-    st.name, st.guild = want, guildKey
+    st.name, st.guild, st.color = want, guildKey, colorKey
+
+    local displayName = want
+    if isCustom then
+        displayName = string.format("|cff%s%s|r", colorKey, want)
+    end
 
     _titledNameGuard = true
     if guild then
@@ -989,18 +1507,43 @@ local function UpdateNameOnlyText(nameFS)
         nameFS:SetMaxLines(2)
         nameFS:SetFormattedText("%s\n" .. string.format("|cff%02x%02x%02x",
             math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5))
-            .. body .. "|r", want, guild)
+            .. body .. "|r", displayName, guild)
     else
         nameFS:SetMaxLines(1)
-        nameFS:SetText(want)
+        nameFS:SetText(displayName)
     end
     _titledNameGuard = false
+end
+
+local function HasAnyPlayerHighlight(fp)
+    if not fp or fp.nameOnlyStylePlayerRelationships ~= true then return false end
+    return fp.nameOnlyCustomEnabled_FRIENDLY_PLAYER_FRIEND == true
+        or fp.nameOnlyCustomEnabled_FRIENDLY_PLAYER_RECENT == true
+        or fp.nameOnlyCustomEnabled_FRIENDLY_PARTY_RAID == true
+        or fp.nameOnlyCustomEnabled_FRIENDLY_GUILD == true
+        or fp.nameOnlyCustomEnabled_FRIENDLY_PLAYER_UNFLAGGED == true
+        or fp.nameOnlyCustomEnabled_FRIENDLY_PLAYER_PVP == true
+        or fp.nameOnlyCustomEnabled_ENEMY_PLAYER_DUEL == true
+end
+
+local function NeedsNameOnlyTextUpdate(unit)
+    if GetBelowNameMode() ~= "none" or FriendlyNameFormat() or ShowFriendlyLevel() or ShowFriendlyGroupBrackets() then
+        return true
+    end
+    local fp = FP()
+    if not fp then return false end
+    if fp.classColorFriendly == false then return true end
+    if unit and UnitIsPlayer(unit) and HasAnyPlayerHighlight(fp) then
+        return true
+    end
+    return false
 end
 
 -- Register a plate's name FontString and (once) hook its SetText so our
 -- composition survives Blizzard's own name updates. The hook body is a
 -- field read or two while Subtitle Text and the Name Format are both off.
 local function AttachNameOnlyText(nameFS, unit)
+    if not unit or not UnitIsPlayer(unit) then return end
     -- Pair the width clear with the (longer) text write: a titled name must
     -- never hit a leftover constraint and ellipsize.
     EnsureNameUnconstrained(nameFS)
@@ -1009,8 +1552,9 @@ local function AttachNameOnlyText(nameFS, unit)
         hookedNameText[nameFS] = true
         hooksecurefunc(nameFS, "SetText", function(self)
             if _titledNameGuard then return end
-            if GetBelowNameMode() == "none" and not FriendlyNameFormat()
-                and not ShowFriendlyLevel() and not ShowFriendlyGroupBrackets() then
+            local u = nameFSUnits[self]
+            if not u or not UnitExists(u) or not UnitIsPlayer(u) then return end
+            if not NeedsNameOnlyTextUpdate(u) then
                 return
             end
             -- Blizzard just overwrote the composed string with its own plain
@@ -1044,6 +1588,7 @@ local function SweepPlayerSubText()
         end
     end
 end
+ns.SweepPlayerSubText = SweepPlayerSubText
 
 -- Re-collapse every visible friendly player name after Blizzard re-anchors
 -- them (UpdateNamePlateOptions / ApplyFrameOptions). Assigns the forward
@@ -1064,7 +1609,7 @@ function ReanchorAllPlayerNames()
 end
 
 -------------------------------------------------------------------------------
---  Hidden frame — Blizzard sub-frames reparented here become invisible
+--  Hidden frame -- Blizzard sub-frames reparented here become invisible
 --  and stop receiving layout updates.  This suppresses the default frames.
 -------------------------------------------------------------------------------
 local hiddenFrame = CreateFrame("Frame")
@@ -1076,11 +1621,11 @@ hiddenFrame:Hide()
 --  NamePlateDriverFrame so suppression happens BEFORE any addon event fires.
 --  This eliminates the flash of Blizzard nameplates.
 -------------------------------------------------------------------------------
-local hookedUFs = {}   -- UnitFrame → true  (hooks are permanent, only applied once)
-local modifiedUFs = {} -- unit → { uf = UnitFrame, nameplate = nameplate }
+local hookedUFs = {}   -- UnitFrame -> true  (hooks are permanent, only applied once)
+local modifiedUFs = {} -- unit -> { uf = UnitFrame, nameplate = nameplate }
+local modifiedUFSet = {} -- uf -> nameplate
 
 local function SuppressBlizzardUF(unit, nameplate)
-    if modifiedUFs[unit] then return end  -- already suppressed
     local uf = nameplate and nameplate.UnitFrame
     if not uf then return end
 
@@ -1094,7 +1639,9 @@ local function SuppressBlizzardUF(unit, nameplate)
     -- Reparent the entire UnitFrame to the hidden frame. This makes everything
     -- invisible. We do NOT unregister events because we need Blizzard's UF to stay
     -- functional for when we restore it (e.g. toggling back to name-only mode).
-    uf:SetParent(hiddenFrame)
+    if uf:GetParent() ~= hiddenFrame then
+        uf:SetParent(hiddenFrame)
+    end
     -- Keep UI widgets (progress gauges on untargetable objectives) visible, as the
     -- enemy plate does.
     if uf.WidgetContainer then
@@ -1107,32 +1654,59 @@ local function SuppressBlizzardUF(unit, nameplate)
         uf.SoftTargetFrame:SetParent(nameplate)
     end
 
-    modifiedUFs[unit] = { uf = uf, nameplate = nameplate }
+    if unit then modifiedUFs[unit] = { uf = uf, nameplate = nameplate } end
+    modifiedUFSet[uf] = nameplate
 
-    -- Permanent SetAlpha hook (once per UF instance)
+    -- Permanent SetAlpha, Show, and SetParent hooks (once per UF instance) so target changes
+    -- and Blizzard updates cannot force a suppressed frame back to visible.
     if not hookedUFs[uf] then
         hookedUFs[uf] = true
         local locked = false
         hooksecurefunc(uf, "SetAlpha", function(self)
             if locked or self:IsForbidden() then return end
-            locked = true
-            local ufUnit = self.unit or (self.GetUnit and self:GetUnit())
-            if ufUnit and modifiedUFs[ufUnit] then
+            if modifiedUFSet[self] then
+                locked = true
                 self:SetAlpha(0)
+                locked = false
             end
-            locked = false
+        end)
+        hooksecurefunc(uf, "Show", function(self)
+            if locked or self:IsForbidden() then return end
+            if modifiedUFSet[self] then
+                locked = true
+                if self:GetParent() ~= hiddenFrame then
+                    self:SetParent(hiddenFrame)
+                end
+                self:SetAlpha(0)
+                locked = false
+            end
+        end)
+        hooksecurefunc(uf, "SetParent", function(self, newParent)
+            if locked or self:IsForbidden() then return end
+            if modifiedUFSet[self] and newParent ~= hiddenFrame then
+                locked = true
+                self:SetParent(hiddenFrame)
+                self:SetAlpha(0)
+                locked = false
+            end
         end)
     end
 end
 
-local function RestoreBlizzardUF(unit)
-    local entry = modifiedUFs[unit]
-    if not entry then return end
-    -- Clear from modifiedUFs FIRST so the SetAlpha hook stops suppressing
-    modifiedUFs[unit] = nil
+local function RestoreBlizzardUF(unit, nameplate)
+    local uf = nameplate and nameplate.UnitFrame
+    if not uf and unit and modifiedUFs[unit] then
+        uf = modifiedUFs[unit].uf
+        nameplate = nameplate or modifiedUFs[unit].nameplate
+    end
+    if not uf then return end
+    if not modifiedUFSet[uf] and not (unit and modifiedUFs[unit]) then return end
+
+    if unit then modifiedUFs[unit] = nil end
+    modifiedUFSet[uf] = nil
+
     -- Restore UnitFrame back to its nameplate parent
-    local uf = entry.uf
-    uf:SetParent(entry.nameplate)
+    uf:SetParent(nameplate)
     if uf.WidgetContainer then
         uf.WidgetContainer:SetParent(uf)
     end
@@ -1149,18 +1723,15 @@ end
 --  by reparenting it to the hidden frame (same technique as health-bar mode).
 --  Then show our own name overlay on top.
 -------------------------------------------------------------------------------
-local nameOnlyNPCSuppressed = {}  -- nameplate → true
+local nameOnlyNPCSuppressed = {}  -- nameplate -> true
 
 local function SuppressNPCNameplate(nameplate, unit)
     if nameOnlyNPCSuppressed[nameplate] then return end
     nameOnlyNPCSuppressed[nameplate] = true
-    -- Always hide Blizzard's default plate (its health bar) for friendly NPCs so
-    -- nothing leaks through...
+    -- Always hide Blizzard's default plate (its health bar) for friendly NPCs and pets
     SuppressBlizzardUF(unit, nameplate)
-    -- ...but only draw our name overlay for NPCs Blizzard would actually name
-    -- (respects the "NPC Names" filter via IsFriendlyNPCShownForUnit). Filtered
-    -- flavor NPCs stay suppressed with no overlay = fully hidden, matching Blizz.
-    if IsFriendlyNPCShownForUnit(unit) then
+    local isPet = IsPetUnit(unit)
+    if isPet or IsFriendlyNPCShownForUnit(unit) then
         ShowNPCOverlay(nameplate, unit)
     end
 end
@@ -1171,9 +1742,7 @@ local function RestoreNPCNameplate(nameplate, unit)
     -- Hide our overlay
     HideNPCOverlay(nameplate)
     -- Restore Blizzard UF
-    if unit then
-        RestoreBlizzardUF(unit)
-    end
+    RestoreBlizzardUF(unit, nameplate)
 end
 
 -- Name-only friendly NPCs never touch friendlyPlates[] -- they're suppressed
@@ -1193,7 +1762,7 @@ function ns.RemoveFriendlyNPCOverlayForUnit(unit, nameplate)
 end
 
 -------------------------------------------------------------------------------
---  NamePlateDriverFrame hooks — suppress Blizzard UFs at the earliest moment
+--  NamePlateDriverFrame hooks -- suppress Blizzard UFs at the earliest moment
 --  These fire synchronously inside Blizzard's nameplate creation, BEFORE
 --  NAME_PLATE_UNIT_ADDED reaches any addon event handler.
 -------------------------------------------------------------------------------
@@ -1201,6 +1770,9 @@ hooksecurefunc(NamePlateDriverFrame, "OnNamePlateAdded", function(_, unit)
     if not unit or unit == "preview" then return end
     if UnitCanAttack("player", unit) then return end
     if UnitIsUnit(unit, "player") then return end
+
+    local nameplate = C_NamePlate.GetNamePlateForUnit(unit)
+    if nameplate then unitToNameplate[unit] = nameplate end
 
     -- Re-assert the name-only font size for this newly added / camera-revealed
     -- plate -- Blizzard's per-plate setup resets the shared font object to default.
@@ -1216,25 +1788,41 @@ hooksecurefunc(NamePlateDriverFrame, "OnNamePlateAdded", function(_, unit)
         -- NPCs. The custom plate itself is gated per-NPC in TryAddFriendlyPlate, so
         -- filtered NPCs end up suppressed with no plate = hidden.
         if not UnitIsPlayer(unit) and not IsFriendlyNPCEnabled() then return end
-        local nameplate = C_NamePlate.GetNamePlateForUnit(unit)
         if nameplate then
             SuppressBlizzardUF(unit, nameplate)
         end
         return
     end
 
-    -- Name-only mode: suppress Blizzard UF and show our own name overlay for NPCs
-    if IsNameOnlyMode() and not UnitIsPlayer(unit) and IsFriendlyNPCEnabled() then
-        local nameplate = C_NamePlate.GetNamePlateForUnit(unit)
+    -- Name-only mode: suppress Blizzard UF for all friendly non-players (NPCs and pets) so healthbars never show!
+    if IsNameOnlyMode() and not UnitIsPlayer(unit) then
         if nameplate then
-            SuppressNPCNameplate(nameplate, unit)
+            SuppressBlizzardUF(unit, nameplate)
+            if nameplate.UnitFrame and nameplate.UnitFrame.name then
+                nameFSUnits[nameplate.UnitFrame.name] = nil
+                nameFSText[nameplate.UnitFrame.name] = nil
+            end
+            local isPet = IsPetUnit(unit)
+            local fp = FP()
+            local isEnemy = UnitCanAttack and UnitCanAttack("player", unit)
+            local showPet
+            if isEnemy then
+                showPet = isPet and (fp and fp.showEnemyPets == true)
+            else
+                showPet = isPet and (fp and fp.showFriendlyPets == true)
+            end
+            local showNPC = not isPet and (fp and fp.showFriendlyNPCs == true)
+            if (showPet and isPet) or (showNPC and IsFriendlyNPCShownForUnit(unit)) then
+                ShowNPCOverlay(nameplate, unit)
+            else
+                HideNPCOverlay(nameplate)
+            end
         end
     end
 
     -- Name-only mode (players): remove Blizzard's width constraint on the
     -- name FontString so long names are never truncated with "...".
     if IsNameOnlyMode() and UnitIsPlayer(unit) then
-        local nameplate = C_NamePlate.GetNamePlateForUnit(unit)
         if nameplate and nameplate.UnitFrame and nameplate.UnitFrame.name then
             -- Name-only player plates render ONLY the name, but Blizzard's
             -- CompactUnitFrame keeps its full ~47-event surface live behind
@@ -1247,6 +1835,8 @@ hooksecurefunc(NamePlateDriverFrame, "OnNamePlateAdded", function(_, unit)
             if not uf:IsForbidden() then
                 uf:UnregisterAllEvents()
                 uf:RegisterUnitEvent("UNIT_NAME_UPDATE", unit)
+                uf:RegisterUnitEvent("UNIT_FACTION", unit)
+                uf:RegisterUnitEvent("UNIT_FLAGS", unit)
                 uf:RegisterEvent("PLAYER_TARGET_CHANGED")
                 uf:RegisterEvent("PLAYER_SOFT_FRIEND_CHANGED")
                 uf:RegisterEvent("PLAYER_SOFT_ENEMY_CHANGED")
@@ -1256,11 +1846,25 @@ hooksecurefunc(NamePlateDriverFrame, "OnNamePlateAdded", function(_, unit)
                 uf:RegisterEvent("RAID_TARGET_UPDATE")
             end
             EnsureNameUnconstrained(nameplate.UnitFrame.name)
-            -- Subtitle Text (inline title + guild line) and the Name Format, all
-            -- composed onto this same FontString.
-            if GetBelowNameMode() ~= "none" or FriendlyNameFormat()
-                or ShowFriendlyLevel() or ShowFriendlyGroupBrackets() then
+            -- Subtitle Text (inline title + guild line), Name Format, Level, and custom target colors
+            if NeedsNameOnlyTextUpdate(unit) then
                 AttachNameOnlyText(nameplate.UnitFrame.name, unit)
+                -- Deferred retries: when units spawn at distance, unit data (guild, PvP, friends list)
+                -- may take a short moment to sync from the server. Re-check so initial colors
+                -- resolve to overrides without waiting for a click/target.
+                local fs = nameplate.UnitFrame.name
+                C_Timer.After(0.1, function()
+                    if nameFSUnits[fs] == unit and UnitExists(unit) then
+                        nameFSText[fs] = nil
+                        UpdateNameOnlyText(fs)
+                    end
+                end)
+                C_Timer.After(0.3, function()
+                    if nameFSUnits[fs] == unit and UnitExists(unit) then
+                        nameFSText[fs] = nil
+                        UpdateNameOnlyText(fs)
+                    end
+                end)
             end
         end
     end
@@ -1271,7 +1875,8 @@ hooksecurefunc(NamePlateDriverFrame, "OnNamePlateRemoved", function(_, unit)
     if not unit or not unit:find("^nameplate") then return end
     -- Clean up the NPC overlay if present, and release the name FontString's
     -- player token: a reused plate must not recompose a name from it.
-    local nameplate = C_NamePlate.GetNamePlateForUnit(unit)
+    local nameplate = unitToNameplate[unit] or (C_NamePlate.GetNamePlateForUnit and C_NamePlate.GetNamePlateForUnit(unit))
+    unitToNameplate[unit] = nil
     if nameplate then
         local nfs = nameplate.UnitFrame and nameplate.UnitFrame.name
         if nfs then nameFSUnits[nfs], nameFSText[nfs] = nil, nil end
@@ -1279,7 +1884,7 @@ hooksecurefunc(NamePlateDriverFrame, "OnNamePlateRemoved", function(_, unit)
         nameOnlyNPCSuppressed[nameplate] = nil
     end
     if modifiedUFs[unit] then
-        RestoreBlizzardUF(unit)
+        RestoreBlizzardUF(unit, nameplate)
     end
 end)
 
@@ -2190,6 +2795,10 @@ function ns.UpdateFriendlyNameplateSystem()
             end
             pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyNPCs", 0, "EllesmereUINameplates")
             pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyNpcs", 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyPlayerMinions", 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyMinions", 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyPets", 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "UnitNameFriendlyMinionName", 0, "EllesmereUINameplates")
         elseif inInstance then
             -- NPC plates only: force off in instances since our frame
             -- suppression doesn't work on protected nameplate frames.
@@ -2208,10 +2817,15 @@ function ns.UpdateFriendlyNameplateSystem()
             end
             pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyNPCs", 0, "EllesmereUINameplates")
             pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyNpcs", 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyPlayerMinions", 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyMinions", 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyPets", 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "UnitNameFriendlyMinionName", 0, "EllesmereUINameplates")
         else
             -- Restore user's preferred friendly CVar state
             if fp then
                 local showNPCs = (fp.showFriendlyNPCs == true)
+                local showPets = (fp.showFriendlyPets == true)
                 if euiManagesPlayers then
                     local nameOnlyVal = (fp.friendlyNameOnly ~= false) and 1 or 0
                     -- Hand back only what a follower dungeon took. Outside that
@@ -2221,6 +2835,10 @@ function ns.UpdateFriendlyNameplateSystem()
                 end
                 pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyNPCs", showNPCs and 1 or 0, "EllesmereUINameplates")
                 pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyNpcs", showNPCs and 1 or 0, "EllesmereUINameplates")
+                pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyPlayerMinions", showPets and 1 or 0, "EllesmereUINameplates")
+                pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyMinions", showPets and 1 or 0, "EllesmereUINameplates")
+                pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyPets", showPets and 1 or 0, "EllesmereUINameplates")
+                pcall(EllesmereUI.SetCVar, "UnitNameFriendlyMinionName", showPets and 1 or 0, "EllesmereUINameplates")
             end
         end
     else
@@ -2238,7 +2856,7 @@ function ns.UpdateFriendlyNameplateSystem()
         -- needs no teardown: full-plate mode suppresses the Blizzard UF
         -- entirely, so its FontString is not rendered.
         for np in pairs(nameOnlyNPCSuppressed) do
-            local u = np.namePlateUnitToken
+            local u = GetNamePlateUnitToken(np)
             RestoreNPCNameplate(np, u)
         end
         friendlyEnabled = true
@@ -2253,7 +2871,7 @@ function ns.UpdateFriendlyNameplateSystem()
         local allPlates = C_NamePlate.GetNamePlates()
         if allPlates then
             for _, nameplate in ipairs(allPlates) do
-                local unit = nameplate.namePlateUnitToken
+                local unit = GetNamePlateUnitToken(nameplate)
                 if unit then units[unit] = true end
             end
         end
@@ -2261,12 +2879,12 @@ function ns.UpdateFriendlyNameplateSystem()
             TryAddFriendlyPlate(unit)
         end
     elseif shouldEnable and friendlyEnabled then
-        -- Already in health-bar mode — re-sweep to pick up NPC plates that
+        -- Already in health-bar mode -- re-sweep to pick up NPC plates that
         -- may have been skipped (e.g. user just toggled showFriendlyNPCs on)
         local allPlates = C_NamePlate.GetNamePlates()
         if allPlates then
             for _, nameplate in ipairs(allPlates) do
-                local unit = nameplate.namePlateUnitToken
+                local unit = GetNamePlateUnitToken(nameplate)
                 if unit then TryAddFriendlyPlate(unit) end
             end
         end
@@ -2277,7 +2895,7 @@ function ns.UpdateFriendlyNameplateSystem()
         ClearAllFriendlyPlates()
         -- Clean up any leftover NPC overlays from name-only mode
         for np in pairs(nameOnlyNPCSuppressed) do
-            local u = np.namePlateUnitToken
+            local u = GetNamePlateUnitToken(np)
             RestoreNPCNameplate(np, u)
         end
     end
@@ -2300,14 +2918,29 @@ function ns.UpdateFriendlyNameplateSystem()
         -- SweepPlayerSubText (protected-plate list) for the Below Name sub text.
         local function SweepNameOnlyPlates()
             local allPlates = C_NamePlate.GetNamePlates()
+            local fp = FP()
             if allPlates then
                 for _, nameplate in ipairs(allPlates) do
-                    local u = nameplate.namePlateUnitToken
+                    local u = GetNamePlateUnitToken(nameplate)
                     if u and not UnitCanAttack("player", u) and not UnitIsUnit(u, "player") and not UnitIsPlayer(u) then
-                        if IsFriendlyNPCEnabled() then
-                            SuppressNPCNameplate(nameplate, u)
+                        SuppressBlizzardUF(u, nameplate)
+                        if nameplate.UnitFrame and nameplate.UnitFrame.name then
+                            nameFSUnits[nameplate.UnitFrame.name] = nil
+                            nameFSText[nameplate.UnitFrame.name] = nil
+                        end
+                        local isPet = IsPetUnit(u)
+                        local isEnemy = UnitCanAttack and UnitCanAttack("player", u)
+                        local showPet
+                        if isEnemy then
+                            showPet = isPet and (fp and fp.showEnemyPets == true)
                         else
-                            RestoreNPCNameplate(nameplate, u)
+                            showPet = isPet and (fp and fp.showFriendlyPets == true)
+                        end
+                        local showNPC = not isPet and (fp and fp.showFriendlyNPCs == true)
+                        if (showPet and isPet) or (showNPC and IsFriendlyNPCShownForUnit(u)) then
+                            ShowNPCOverlay(nameplate, u)
+                        else
+                            HideNPCOverlay(nameplate)
                         end
                     end
                 end
@@ -2320,7 +2953,7 @@ function ns.UpdateFriendlyNameplateSystem()
         C_Timer.After(0.1, SweepNameOnlyPlates)
         C_Timer.After(0.5, SweepNameOnlyPlates)
     elseif not shouldEnable then
-        -- Not in health-bar mode — restore fonts (covers disabled + name-only-off)
+        -- Not in health-bar mode -- restore fonts (covers disabled + name-only-off)
         RestoreFriendlyFontOverride()
     end
 
@@ -2329,7 +2962,7 @@ function ns.UpdateFriendlyNameplateSystem()
 end
 
 -------------------------------------------------------------------------------
---  Bootstrap — wait for DB then enable system
+--  Bootstrap -- wait for DB then enable system
 --  PLAYER_LOGIN enables the system; PLAYER_ENTERING_WORLD does a follow-up
 --  sweep because some friendly nameplates may not be queryable yet at
 --  PLAYER_LOGIN time (the world isn't fully loaded).
@@ -2363,14 +2996,28 @@ local initFrame = CreateFrame("Frame")
 initFrame:RegisterEvent("PLAYER_LOGIN")
 initFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 initFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+initFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+initFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
+initFrame:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
 initFrame:SetScript("OnEvent", function(self, event)
+    if event == "PLAYER_TARGET_CHANGED" or event == "UPDATE_MOUSEOVER_UNIT" then
+        OnTargetChangedNPCOverlays()
+        C_Timer.After(0, OnTargetChangedNPCOverlays)
+        return
+    end
+    if event == "GROUP_ROSTER_UPDATE" then
+        UpdateRecentGroupMembers()
+        return
+    end
     if event == "PLAYER_LOGIN" then
         self:UnregisterEvent("PLAYER_LOGIN")
+        UpdateRecentGroupMembers()
         -- The plates paint from these settings (the Name Format sync's first
         -- record, so an unchanged first refresh repaints nothing).
         StampFriendlyNames()
         ns.UpdateFriendlyNameplateSystem()
     elseif event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED_NEW_AREA" then
+        UpdateRecentGroupMembers()
         -- Re-evaluate the friendly system on every zone transition so
         -- follower dungeons (and similar) correctly disable/enable it.
         ns.UpdateFriendlyNameplateSystem()
@@ -2387,20 +3034,39 @@ initFrame:SetScript("OnEvent", function(self, event)
                 local allPlates = C_NamePlate.GetNamePlates()
                 if allPlates then
                     for _, nameplate in ipairs(allPlates) do
-                        local u = nameplate.namePlateUnitToken
+                        local u = GetNamePlateUnitToken(nameplate)
                         if u then TryAddFriendlyPlate(u) end
                     end
                 end
             end
             -- Name-only NPC sweep: suppress health bars and color names. Per-unit
             -- gate respects Blizzard's "NPC Names" filter (skip widgets-only NPCs).
-            if IsNameOnlyMode() and IsFriendlyNPCEnabled() then
+            if IsNameOnlyMode() then
                 local allPlates = C_NamePlate.GetNamePlates()
+                local fp = FP()
                 if allPlates then
                     for _, nameplate in ipairs(allPlates) do
-                        local u = nameplate.namePlateUnitToken
+                        local u = GetNamePlateUnitToken(nameplate)
                         if u and not UnitCanAttack("player", u) and not UnitIsUnit(u, "player") and not UnitIsPlayer(u) then
-                            SuppressNPCNameplate(nameplate, u)
+                            SuppressBlizzardUF(u, nameplate)
+                            if nameplate.UnitFrame and nameplate.UnitFrame.name then
+                                nameFSUnits[nameplate.UnitFrame.name] = nil
+                                nameFSText[nameplate.UnitFrame.name] = nil
+                            end
+                            local isPet = IsPetUnit(u)
+                            local isEnemy = UnitCanAttack and UnitCanAttack("player", u)
+                            local showPet
+                            if isEnemy then
+                                showPet = isPet and (fp and fp.showEnemyPets == true)
+                            else
+                                showPet = isPet and (fp and fp.showFriendlyPets == true)
+                            end
+                            local showNPC = not isPet and (fp and fp.showFriendlyNPCs == true)
+                            if (showPet and isPet) or (showNPC and IsFriendlyNPCShownForUnit(u)) then
+                                ShowNPCOverlay(nameplate, u)
+                            else
+                                HideNPCOverlay(nameplate)
+                            end
                         end
                     end
                 end
@@ -2413,28 +3079,54 @@ initFrame:SetScript("OnEvent", function(self, event)
 end)
 
 -------------------------------------------------------------------------------
---  Exported API — called from EllesmereNameplates.lua (NAME_PLATE_UNIT_ADDED/REMOVED)
+--  Exported API -- called from EllesmereNameplates.lua (NAME_PLATE_UNIT_ADDED/REMOVED)
 --  These wrap the new overlay system so the main file doesn't need to change.
 -------------------------------------------------------------------------------
 function ns.TryColorFriendlyNPCName(unit, nameplate)
-    -- In name-only mode, NPC overlay handles coloring automatically
-    -- (SuppressNPCNameplate is called from OnNamePlateAdded hook)
+    if IsNameOnlyMode() and not UnitIsPlayer(unit) then
+        local overlay = npcOverlays[nameplate]
+        if overlay and overlay.unit then
+            ApplyOverlayStyle(overlay, overlay.unit)
+        end
+    end
 end
 
 function ns.TrySuppressNPCHealthBar(unit, nameplate)
-    -- In name-only mode, NPC overlay fully suppresses the Blizzard UF
-    -- (SuppressNPCNameplate is called from OnNamePlateAdded hook)
+    if IsNameOnlyMode() and not UnitIsPlayer(unit) then
+        if nameplate then
+            SuppressBlizzardUF(unit, nameplate)
+            if nameplate.UnitFrame and nameplate.UnitFrame.name then
+                nameFSUnits[nameplate.UnitFrame.name] = nil
+                nameFSText[nameplate.UnitFrame.name] = nil
+            end
+            local isPet = IsPetUnit(unit)
+            local fp = FP()
+            local isEnemy = UnitCanAttack and UnitCanAttack("player", unit)
+            local showPet
+            if isEnemy then
+                showPet = isPet and (fp and fp.showEnemyPets == true)
+            else
+                showPet = isPet and (fp and fp.showFriendlyPets == true)
+            end
+            local showNPC = not isPet and (fp and fp.showFriendlyNPCs == true)
+            if (showPet and isPet) or (showNPC and IsFriendlyNPCShownForUnit(unit)) then
+                ShowNPCOverlay(nameplate, unit)
+            else
+                HideNPCOverlay(nameplate)
+            end
+        end
+    end
 end
 
 function ns.RestoreFriendlyNPCNameColor(nameplate)
-    local unit = nameplate and nameplate.namePlateUnitToken
+    local unit = nameplate and GetNamePlateUnitToken(nameplate)
     if unit and not UnitIsPlayer(unit) then
         RestoreNPCNameplate(nameplate, unit)
     end
 end
 
 function ns.RestoreNPCHealthBar(nameplate)
-    local unit = nameplate and nameplate.namePlateUnitToken
+    local unit = nameplate and GetNamePlateUnitToken(nameplate)
     if unit and not UnitIsPlayer(unit) then
         RestoreNPCNameplate(nameplate, unit)
     end

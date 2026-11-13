@@ -197,19 +197,20 @@ local function BuildGeneralPage(pageName, parent, yOffset)
     end
 
     ---------------------------------------------------------------
-    --  Name Only inline swatches (White + Class Color) mirror the Target Arrows double-swatch pattern: classColorFriendly picks the active swatch (inactive dims); neither opens a picker (White fixed, Class = player's class color). Both gray out when Name Only is off.
+    ---------------------------------------------------------------
+    --  Name Only inline swatches (Custom + Class Color) and granular Target Colors cog popup.
     ---------------------------------------------------------------
     if not EllesmereUI._prebuilding then
         local rightRgn = friendlyRow._rightRegion
-        local whiteSwatch, updateWhite, classSwatch, updateClass
+        local customSwatch, updateCustom, classSwatch, updateClass
         local function refreshNameSwatches()
-            if updateWhite then updateWhite() end
+            if updateCustom then updateCustom() end
             if updateClass then updateClass() end
             local off = nameOnlyOff()
             local useClass = DBVal("classColorFriendly") ~= false
-            whiteSwatch:SetAlpha(off and 0.15 or (useClass and 0.3 or 1))
+            customSwatch:SetAlpha(off and 0.15 or (useClass and 0.3 or 1))
             classSwatch:SetAlpha(off and 0.15 or (useClass and 1 or 0.3))
-            whiteSwatch:SetMouseClickEnabled(not off)
+            customSwatch:SetMouseClickEnabled(not off)
             classSwatch:SetMouseClickEnabled(not off)
         end
         local function ApplyClassColored(useClass)
@@ -217,19 +218,39 @@ local function BuildGeneralPage(pageName, parent, yOffset)
             pcall(EllesmereUI.SetCVar, "ShowClassColorInFriendlyNameplate", useClass and 1 or 0, "EllesmereUINameplates")
             pcall(EllesmereUI.SetCVar, "nameplateUseClassColorForFriendlyPlayerUnitNames", ns.FriendlyNameClassCVar(DB()), "EllesmereUINameplates")
             if ns.RefreshAllSettings then ns.RefreshAllSettings() end
-            refreshNameSwatches()
+            if ns.RefreshFriendlyColors then ns.RefreshFriendlyColors() end
+            if ns.RefreshNPCOverlayStyle then ns.RefreshNPCOverlayStyle() end
+            if ns.SweepPlayerSubText then ns.SweepPlayerSubText() end
+            EllesmereUI:RefreshPage()
         end
-        -- White swatch: fixed white, not editable; clicking only selects the non-class-colored mode (default OnClick picker replaced below).
-        whiteSwatch, updateWhite = EllesmereUI.BuildColorSwatch(rightRgn, rightRgn:GetFrameLevel() + 5,
-            function() return 1, 1, 1 end,
-            function() end, nil, 20)
-        PP.Point(whiteSwatch, "RIGHT", rightRgn._control, "LEFT", -8, 0)
-        whiteSwatch:SetScript("OnClick", function()
+        -- Custom color swatch: clicking while inactive switches to custom mode; clicking while active opens the color picker.
+        customSwatch, updateCustom = EllesmereUI.BuildColorSwatch(rightRgn, rightRgn:GetFrameLevel() + 5,
+            function()
+                local c = DBVal("friendlyNameCustomColor") or defaults.friendlyNameCustomColor
+                return c.r, c.g, c.b
+            end,
+            function(r, g, b)
+                DB().friendlyNameCustomColor = { r = r, g = g, b = b }
+                if ns.RefreshFriendlyColors then ns.RefreshFriendlyColors() end
+                if ns.RefreshNPCOverlayStyle then ns.RefreshNPCOverlayStyle() end
+                if ns.SweepPlayerSubText then ns.SweepPlayerSubText() end
+            end, nil, 20)
+        PP.Point(customSwatch, "RIGHT", rightRgn._control, "LEFT", -8, 0)
+        local origCustomClick = customSwatch:GetScript("OnClick")
+        customSwatch:SetScript("OnClick", function(self, ...)
             if nameOnlyOff() then return end
-            ApplyClassColored(false)
+            if DBVal("classColorFriendly") ~= false then
+                ApplyClassColored(false)
+                return
+            end
+            if origCustomClick then origCustomClick(self, ...) end
         end)
-        whiteSwatch:SetScript("OnEnter", function() EllesmereUI.ShowWidgetTooltip(whiteSwatch, "White") end)
-        whiteSwatch:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+        customSwatch:SetScript("OnEnter", function()
+            local isActive = (DBVal("classColorFriendly") == false)
+            EllesmereUI.ShowWidgetTooltip(customSwatch, isActive and "Custom Color (Active - Click to choose color)" or "Custom Color (Click to activate)")
+        end)
+        customSwatch:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+
         -- Class color swatch: player's class color; selects class-colored mode.
         classSwatch, updateClass = EllesmereUI.BuildColorSwatch(rightRgn, rightRgn:GetFrameLevel() + 5,
             function()
@@ -239,14 +260,204 @@ local function BuildGeneralPage(pageName, parent, yOffset)
                 return 1, 1, 1
             end,
             function() end, nil, 20)
-        PP.Point(classSwatch, "RIGHT", whiteSwatch, "LEFT", -8, 0)
-        rightRgn._lastInline = classSwatch
+        PP.Point(classSwatch, "RIGHT", customSwatch, "LEFT", -8, 0)
         classSwatch:SetScript("OnClick", function()
             if nameOnlyOff() then return end
-            ApplyClassColored(true)
+            if DBVal("classColorFriendly") == false then
+                ApplyClassColored(true)
+            end
         end)
-        classSwatch:SetScript("OnEnter", function() EllesmereUI.ShowWidgetTooltip(classSwatch, "Class Color") end)
+        classSwatch:SetScript("OnEnter", function()
+            local isActive = (DBVal("classColorFriendly") ~= false)
+            EllesmereUI.ShowWidgetTooltip(classSwatch, isActive and "Class Color (Active)" or "Class Color (Click to activate)")
+        end)
         classSwatch:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+
+        rightRgn._lastInline = classSwatch
+
+        -- Migrate prior test setting nameOnlyStyleNonPlayers if present
+        local curDb = DB()
+        if curDb and curDb.nameOnlyStyleNonPlayers ~= nil then
+            if curDb.nameOnlyStyleFriendlyNPCs == nil then curDb.nameOnlyStyleFriendlyNPCs = curDb.nameOnlyStyleNonPlayers end
+            if curDb.nameOnlyStyleHostileNPCs == nil then curDb.nameOnlyStyleHostileNPCs = curDb.nameOnlyStyleNonPlayers end
+            curDb.nameOnlyStyleNonPlayers = nil
+        end
+
+        -- Target colors cog popup (16 granular target categories in 3 columns)
+        local targetRows = { {}, {}, {} }
+
+        -- Section 1 master toggle (Player Relationships)
+        targetRows[1][1] = {
+            type = "toggle",
+            label = "Style Player Relationships",
+            tooltip = "When enabled, allows EllesmereUI to style and custom-color friends, guild members, group members, and other player relationships in Name Only mode.\n\nWhen disabled, all players keep their base look (Class Color or Custom Color).",
+            disabled = friendlyPlayersOff,
+            disabledTooltip = "Show EUI Friendly Player Nameplates",
+            get = function()
+                return DBVal("nameOnlyStylePlayerRelationships") == true
+            end,
+            set = function(v)
+                DB().nameOnlyStylePlayerRelationships = v and true or false
+                if ns.RefreshFriendlyColors then ns.RefreshFriendlyColors() end
+                if ns.RefreshNPCOverlayStyle then ns.RefreshNPCOverlayStyle() end
+                if ns.UpdateFriendlyNameplateSystem then ns.UpdateFriendlyNameplateSystem() end
+                if ns.SweepPlayerSubText then ns.SweepPlayerSubText() end
+                EllesmereUI:RefreshPage()
+            end,
+        }
+
+        -- Section 2 master toggle (Friendly & Neutral Units)
+        targetRows[2][1] = {
+            type = "toggle",
+            label = "Style Friendly & Neutral Units",
+            tooltip = "When enabled, allows EllesmereUI to style and custom-color friendly/neutral NPCs, pets, and critters in Name Only mode.\n\nWhen disabled, non-player units keep their standard Blizzard styling.",
+            get = function()
+                return DBVal("nameOnlyStyleFriendlyNPCs") == true
+            end,
+            set = function(v)
+                DB().nameOnlyStyleFriendlyNPCs = v and true or false
+                if ns.RefreshFriendlyColors then ns.RefreshFriendlyColors() end
+                if ns.RefreshNPCOverlayStyle then ns.RefreshNPCOverlayStyle() end
+                if ns.UpdateFriendlyNameplateSystem then ns.UpdateFriendlyNameplateSystem() end
+                if ns.SweepPlayerSubText then ns.SweepPlayerSubText() end
+                EllesmereUI:RefreshPage()
+            end,
+        }
+
+        -- Section 3 master toggle (Opposing Faction Units)
+        targetRows[3][1] = {
+            type = "toggle",
+            label = "Style Opposing Faction Units",
+            tooltip = "When enabled, allows EllesmereUI to style and custom-color opposing faction NPCs, tapped NPCs, and NPC pets in Name Only mode.\n\nWhen disabled, these units keep their standard Blizzard styling.",
+            get = function()
+                return DBVal("nameOnlyStyleHostileNPCs") == true
+            end,
+            set = function(v)
+                DB().nameOnlyStyleHostileNPCs = v and true or false
+                if ns.RefreshFriendlyColors then ns.RefreshFriendlyColors() end
+                if ns.RefreshNPCOverlayStyle then ns.RefreshNPCOverlayStyle() end
+                if ns.UpdateFriendlyNameplateSystem then ns.UpdateFriendlyNameplateSystem() end
+                if ns.SweepPlayerSubText then ns.SweepPlayerSubText() end
+                EllesmereUI:RefreshPage()
+            end,
+        }
+
+        local function GetTargetRowDisabled(item)
+            local secIdx = item.sec or 1
+            if secIdx == 1 then
+                if friendlyPlayersOff() then return true end
+                return DBVal("nameOnlyStylePlayerRelationships") ~= true
+            elseif secIdx == 2 then
+                if item.key == "PET_MINION_FRIENDLY" or item.key == "PET_MINION_NPC_FRIENDLY" then
+                    if DBVal("showFriendlyPets") ~= true then return true end
+                else
+                    if DBVal("showFriendlyNPCs") ~= true then return true end
+                end
+                return DBVal("nameOnlyStyleFriendlyNPCs") ~= true
+            elseif secIdx == 3 then
+                if item.key == "PET_MINION_HOSTILE" then
+                    if DBVal("showEnemyPets") ~= true then return true end
+                end
+                return DBVal("nameOnlyStyleHostileNPCs") ~= true
+            end
+            return false
+        end
+
+        local function GetTargetRowDisabledTip(item)
+            local secIdx = item.sec or 1
+            if secIdx == 1 then
+                if friendlyPlayersOff() then return "Show EUI Friendly Player Nameplates" end
+                return "Style Player Relationships"
+            elseif secIdx == 2 then
+                if (item.key == "PET_MINION_FRIENDLY" or item.key == "PET_MINION_NPC_FRIENDLY") and DBVal("showFriendlyPets") ~= true then
+                    return "Requires 'Show Friendly Pet Nameplates' to be enabled"
+                elseif item.key ~= "PET_MINION_FRIENDLY" and item.key ~= "PET_MINION_NPC_FRIENDLY" and DBVal("showFriendlyNPCs") ~= true then
+                    return "Requires 'Show Friendly NPC Nameplates' to be enabled"
+                end
+                return "Style Friendly & Neutral Units"
+            elseif secIdx == 3 then
+                if item.key == "PET_MINION_HOSTILE" and DBVal("showEnemyPets") ~= true then
+                    return "Requires 'Show Enemy Pet Nameplates' to be enabled"
+                end
+                return "Style Opposing Faction Units"
+            end
+            return nil
+        end
+
+        if ns.NAME_ONLY_TARGETS then
+            for _, item in ipairs(ns.NAME_ONLY_TARGETS) do
+                local secIdx = item.sec or 1
+                local rowList = targetRows[secIdx]
+                if rowList then
+                    rowList[#rowList + 1] = {
+                        type = "togglecolor",
+                        label = item.label,
+                        tooltip = item.tip,
+                        disabled = function() return GetTargetRowDisabled(item) end,
+                        disabledTooltip = function() return GetTargetRowDisabledTip(item) end,
+                        rawTooltip = true,
+                        getToggle = function()
+                            return DBVal("nameOnlyCustomEnabled_" .. item.key) == true
+                        end,
+                        setToggle = function(v)
+                            DB()["nameOnlyCustomEnabled_" .. item.key] = v and true or false
+                            if ns.RefreshFriendlyColors then ns.RefreshFriendlyColors() end
+                            if ns.RefreshNPCOverlayStyle then ns.RefreshNPCOverlayStyle() end
+                            if ns.SweepPlayerSubText then ns.SweepPlayerSubText() end
+                        end,
+                        getColor = function()
+                            local c = DBVal("nameOnlyCustomColor_" .. item.key) or defaults["nameOnlyCustomColor_" .. item.key] or item.defColor
+                            return c.r, c.g, c.b
+                        end,
+                        setColor = function(r, g, b)
+                            DB()["nameOnlyCustomColor_" .. item.key] = { r = r, g = g, b = b }
+                            if ns.RefreshFriendlyColors then ns.RefreshFriendlyColors() end
+                            if ns.RefreshNPCOverlayStyle then ns.RefreshNPCOverlayStyle() end
+                            if ns.SweepPlayerSubText then ns.SweepPlayerSubText() end
+                        end,
+                    }
+                end
+            end
+        end
+
+        EllesmereUI.BuildInlineCog(rightRgn, {
+            chain = true,
+            anchorTo = classSwatch,
+            disabled = nameOnlyOff,
+            disabledTooltip = "Requires Name Only mode",
+            rawTooltip = true,
+            tip = "Nameplate Highlights (Click to configure priority color overrides)",
+            title = "Nameplate Highlights",
+            columnsFrom = 2,
+            sections = {
+                { title = "Player Relationships", rows = targetRows[1] },
+                { title = "Friendly & Neutral Units", rows = targetRows[2] },
+                { title = "Opposing Faction NPCs & Pets", rows = targetRows[3] },
+            },
+            footer = {
+                buttonText = "Set Colors to Default",
+                buttonWidth = 170,
+                buttonTooltip = "Resets all target highlight colors and custom nameplate colors to their default values.\n\nYour toggle selections are preserved.",
+                buttonAction = function()
+                    if ns.NAME_ONLY_TARGETS then
+                        for _, item in ipairs(ns.NAME_ONLY_TARGETS) do
+                            local def = defaults["nameOnlyCustomColor_" .. item.key] or item.defColor
+                            if def then
+                                DB()["nameOnlyCustomColor_" .. item.key] = { r = def.r, g = def.g, b = def.b }
+                            end
+                        end
+                    end
+                    local defCustom = defaults.friendlyNameCustomColor or { r = 1, g = 1, b = 1 }
+                    DB().friendlyNameCustomColor = { r = defCustom.r, g = defCustom.g, b = defCustom.b }
+                    if updateCustom then updateCustom() end
+                    if ns.RefreshFriendlyColors then ns.RefreshFriendlyColors() end
+                    if ns.RefreshNPCOverlayStyle then ns.RefreshNPCOverlayStyle() end
+                    if ns.SweepPlayerSubText then ns.SweepPlayerSubText() end
+                    EllesmereUI:RefreshPage()
+                end,
+            },
+        })
+
         EllesmereUI.RegisterWidgetRefresh(refreshNameSwatches)
         refreshNameSwatches()
     end
@@ -255,6 +466,10 @@ local function BuildGeneralPage(pageName, parent, yOffset)
     --  Subtitle Text: title renders inline with the name, guild sits on its own line below. The colour pair styles ONLY the guild line -- the inline title is part of the name string, using its colour.
     ---------------------------------------------------------------
     -- Custom/Class pair follows the multiSwatch convention: clicking the INACTIVE custom swatch only selects custom mode (click again to open the picker); the inactive swatch dims, both grey out together.
+    local function guildColorDisabled()
+        return subtitleGuildOff() or DBVal("friendlyBelowNameMatchNameColor") == true
+    end
+
     local function MakeGuildColorSwatches()
         return {
             { tooltip = "Custom Color", hasAlpha = false,
@@ -267,6 +482,7 @@ local function BuildGeneralPage(pageName, parent, yOffset)
                   if ns.RefreshFriendlyBelowName then ns.RefreshFriendlyBelowName() end
               end,
               onClick = function(self)
+                  if guildColorDisabled() then return end
                   if DBVal("friendlyBelowNameClassColor") == true then
                       DB().friendlyBelowNameClassColor = false
                       if ns.RefreshFriendlyBelowName then ns.RefreshFriendlyBelowName() end
@@ -276,7 +492,7 @@ local function BuildGeneralPage(pageName, parent, yOffset)
                   if self._eabOrigClick then self._eabOrigClick(self) end
               end,
               refreshAlpha = function()
-                  if subtitleGuildOff() then return 0.15 end
+                  if guildColorDisabled() then return 0.15 end
                   return (DBVal("friendlyBelowNameClassColor") == true) and 0.3 or 1
               end },
             { tooltip = "Class Color", hasAlpha = false,
@@ -288,12 +504,13 @@ local function BuildGeneralPage(pageName, parent, yOffset)
               end,
               setValue = function() end,
               onClick = function()
+                  if guildColorDisabled() then return end
                   DB().friendlyBelowNameClassColor = true
                   if ns.RefreshFriendlyBelowName then ns.RefreshFriendlyBelowName() end
                   EllesmereUI:RefreshPage()
               end,
               refreshAlpha = function()
-                  if subtitleGuildOff() then return 0.15 end
+                  if guildColorDisabled() then return 0.15 end
                   return (DBVal("friendlyBelowNameClassColor") == true) and 1 or 0.3
               end },
         }
@@ -354,10 +571,11 @@ local function BuildGeneralPage(pageName, parent, yOffset)
             EllesmereUI:RefreshPage()
           end },
         { type="multiSwatch", text="Guild Text Color",
-          disabled=subtitleGuildOff,
+          disabled=guildColorDisabled,
           disabledTooltip=function()
               if friendlyPlayersOff() then return "Show EUI Friendly Player Nameplates" end
-              return "This option requires Subtitle Text to include the Guild Name"
+              if subtitleGuildOff() then return "This option requires Subtitle Text to include the Guild Name" end
+              return "Match Player Name Color is enabled in Name Text Settings"
           end,
           rawTooltip=function() return not friendlyPlayersOff() end,
           swatches = MakeGuildColorSwatches() });  y = y - h
@@ -407,6 +625,17 @@ local function BuildGeneralPage(pageName, parent, yOffset)
                     DB().friendlyBelowNameGuildBrackets = v and true or false
                     if ns.RefreshFriendlyBelowName then ns.RefreshFriendlyBelowName() end
                   end },
+                { type = "toggle", label = "Match Player Name Color",
+                  tooltip = "Colors the guild name to match the player's name color (including custom colors and active highlights).\n\nWhen disabled, the guild uses the Guild Text Color swatches.",
+                  disabled = subtitleGuildOff,
+                  disabledTooltip = "This option requires Subtitle Text to include the Guild Name",
+                  rawTooltip = true,
+                  get = function() return DBVal("friendlyBelowNameMatchNameColor") == true end,
+                  set = function(v)
+                    DB().friendlyBelowNameMatchNameColor = v and true or false
+                    if ns.RefreshFriendlyBelowName then ns.RefreshFriendlyBelowName() end
+                    EllesmereUI:RefreshPage()
+                  end },
                 { type = "toggle", label = "Show [] Around Group/Raid",
                   tooltip = "Wraps party members' names in party-blue [Name] brackets (including your own raid subgroup) and other raid members' names in raid-orange [Name] brackets.",
                   rawTooltip = true,
@@ -420,6 +649,15 @@ local function BuildGeneralPage(pageName, parent, yOffset)
     end
 
     local npcRow
+    local function friendlyNPCSizeDisabled()
+        return nameOnlyOff() or DBVal("showFriendlyNPCs") ~= true or DBVal("nameOnlyStyleFriendlyNPCs") ~= true
+    end
+    local function friendlyNPCSizeDisabledTooltip()
+        if nameOnlyOff() then return "Make Friendly Nameplates Name Only" end
+        if DBVal("showFriendlyNPCs") ~= true then return "Show Friendly NPC Nameplates" end
+        return "Style Friendly & Neutral Units"
+    end
+
     npcRow, h = W:DualRow(parent, y,
         { type="toggle", text="Show Friendly NPC Nameplates",
           getValue=function() return DBVal("showFriendlyNPCs") == true end,
@@ -430,13 +668,17 @@ local function BuildGeneralPage(pageName, parent, yOffset)
             if ns.UpdateFriendlyNameplateSystem then ns.UpdateFriendlyNameplateSystem() end
             EllesmereUI:RefreshPage()
           end },
-        { type="toggle", text="Show Enemy Pet Nameplates",
-          getValue=function() return DBVal("showEnemyPets") == true end,
+        { type="slider", text="Friendly NPC Name Size", trackWidth=120,
+          min=8, max=30, step=1,
+          disabled=friendlyNPCSizeDisabled,
+          disabledTooltip=friendlyNPCSizeDisabledTooltip,
+          rawTooltip=true,
+          getValue=function() return DBVal("friendlyNPCNameSize") or defaults.friendlyNPCNameSize end,
           setValue=function(v)
-            DB().showEnemyPets = v
-            pcall(EllesmereUI.SetCVar, "nameplateShowEnemyPets", v and 1 or 0, "EllesmereUINameplates")
+            DB().friendlyNPCNameSize = v
+            if ns.RefreshNPCOverlayStyle then ns.RefreshNPCOverlayStyle() end
           end,
-          tooltip="Toggle visibility of enemy pet nameplates." });  y = y - h
+          tooltip="Adjusts the size of friendly NPC names shown in Name Only mode. Default is 13." });  y = y - h
 
     -- Cog popup for NPC nameplate settings (Show NPC Titles)
     do
@@ -549,15 +791,94 @@ local function BuildGeneralPage(pageName, parent, yOffset)
         refreshNpcSwatch()
     end
 
+    -- Inline cog on Friendly NPC Name Size for subtitle text size
+    if not EllesmereUI._prebuilding then
+        EllesmereUI.BuildInlineCog(npcRow._rightRegion, {
+            disabled = friendlyNPCSizeDisabled,
+            disabledTooltip = friendlyNPCSizeDisabledTooltip,
+            rawTooltip = true,
+            title = "NPC Subtitle Settings",
+            rows = {
+                { type = "slider", label = "Subtitle Size", min = 6, max = 30, step = 1,
+                  get = function() return DBVal("friendlyNPCTitleSize") or defaults.friendlyNPCTitleSize end,
+                  set = function(v)
+                    DB().friendlyNPCTitleSize = v
+                    if ns.RefreshNPCOverlayStyle then ns.RefreshNPCOverlayStyle() end
+                  end },
+            },
+        })
+    end
+
+    local function friendlyPetSizeDisabled()
+        return nameOnlyOff() or DBVal("showFriendlyPets") ~= true or DBVal("nameOnlyStyleFriendlyNPCs") ~= true
+    end
+    local function friendlyPetSizeDisabledTooltip()
+        if nameOnlyOff() then return "Make Friendly Nameplates Name Only" end
+        if DBVal("showFriendlyPets") ~= true then return "Show Friendly Pet Nameplates" end
+        return "Style Friendly & Neutral Units"
+    end
+
+    local petRow
+    petRow, h = W:DualRow(parent, y,
+        { type="toggle", text="Show Friendly Pet Nameplates",
+          tooltip="Toggle visibility of friendly player pet and minion nameplates.",
+          getValue=function() return DBVal("showFriendlyPets") == true end,
+          setValue=function(v)
+            DB().showFriendlyPets = v
+            pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyPlayerMinions", v and 1 or 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyMinions", v and 1 or 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "nameplateShowFriendlyPets", v and 1 or 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "UnitNameFriendlyMinionName", v and 1 or 0, "EllesmereUINameplates")
+            if ns.UpdateFriendlyNameplateSystem then ns.UpdateFriendlyNameplateSystem() end
+            EllesmereUI:RefreshPage()
+          end },
+        { type="slider", text="Friendly Pet Name Size", trackWidth=120,
+          min=8, max=30, step=1,
+          disabled=friendlyPetSizeDisabled,
+          disabledTooltip=friendlyPetSizeDisabledTooltip,
+          rawTooltip=true,
+          getValue=function() return DBVal("friendlyPetNameSize") or defaults.friendlyPetNameSize end,
+          setValue=function(v)
+            DB().friendlyPetNameSize = v
+            if ns.RefreshNPCOverlayStyle then ns.RefreshNPCOverlayStyle() end
+          end,
+          tooltip="Adjusts the size of friendly player pet and minion names shown in Name Only mode. Default is 13." });  y = y - h
+
+    -- Inline cog on Friendly Pet Name Size for owner subtitle text size
+    if not EllesmereUI._prebuilding then
+        EllesmereUI.BuildInlineCog(petRow._rightRegion, {
+            disabled = friendlyPetSizeDisabled,
+            disabledTooltip = friendlyPetSizeDisabledTooltip,
+            rawTooltip = true,
+            title = "Pet Subtitle Settings",
+            rows = {
+                { type = "slider", label = "Owner Text Size", min = 6, max = 30, step = 1,
+                  get = function() return DBVal("friendlyPetTitleSize") or defaults.friendlyPetTitleSize end,
+                  set = function(v)
+                    DB().friendlyPetTitleSize = v
+                    if ns.RefreshNPCOverlayStyle then ns.RefreshNPCOverlayStyle() end
+                  end },
+            },
+        })
+    end
+
     _, h = W:DualRow(parent, y,
+        { type="toggle", text="Show Enemy Pet Nameplates",
+          getValue=function() return DBVal("showEnemyPets") == true end,
+          setValue=function(v)
+            DB().showEnemyPets = v
+            pcall(EllesmereUI.SetCVar, "nameplateShowEnemyPets", v and 1 or 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "nameplateShowEnemyMinions", v and 1 or 0, "EllesmereUINameplates")
+            pcall(EllesmereUI.SetCVar, "UnitNameEnemyMinionName", v and 1 or 0, "EllesmereUINameplates")
+          end,
+          tooltip="Toggle visibility of enemy pet nameplates." },
         { type="toggle", text="Friendly Names Not Clickable",
           tooltip="Make friendly player and NPC nameplates click-through so their names never block your mouse or cause accidental friendly targeting.\n\nUse this when friendly names get in the way of clicking the world or the enemy nameplates behind them.",
           getValue=function() return DBVal("friendlyClickThrough") == true end,
           setValue=function(v)
             DB().friendlyClickThrough = v
             if ns.UpdateFriendlyClickThrough then ns.UpdateFriendlyClickThrough() end
-          end },
-        EllesmereUI.BlankRowCfg());  y = y - h
+          end });  y = y - h
 
     -- Inline DIRECTIONS cog on Friendly Name Size: name-only vertical distance
     if not EllesmereUI._prebuilding then
