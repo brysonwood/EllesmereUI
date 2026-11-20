@@ -108,6 +108,8 @@ initFrame:SetScript("OnEvent", function(self)
                 -- the loot window taught: they are what the kinds are read from.
                 local sp = EllesmereUIDB.sparkles
                 EllesmereUIDB.sparkles = sp and { held = sp.held, containers = sp.containers } or nil
+                -- Each character's own follow-the-professions switch.
+                EllesmereUI.ClearCharField("lootSparkles")
                 EllesmereUIDB.mapTravel = nil
                 -- The game's mapFade from before stays, so Apply can give it back.
                 local mf = EllesmereUIDB.worldMapFade

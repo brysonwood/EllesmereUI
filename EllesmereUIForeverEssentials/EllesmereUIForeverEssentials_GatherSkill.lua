@@ -222,6 +222,7 @@ EllesmereUI._GatherSkill = {
     Cfg = F.Cfg,
     Apply = Apply,
     NodeKind = NodeKind,
+    Skill = Skill,  -- the rank in a skill line, nil without it (the sparkles read professions)
 }
 
 F.Start(Apply)

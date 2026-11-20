@@ -88,6 +88,68 @@ local F = module.Feature("sparkles", {
 
 local GS = EllesmereUI._GatherSkill  -- the node names Gathering Skill keeps
 
+-------------------------------------------------------------------------------
+--  Following this character's professions
+-------------------------------------------------------------------------------
+-- The ore and herb kinds can follow what the character can actually gather.
+-- The switch is this character's own, on its roster entry (an account-wide
+-- one would have an enchanter sparkle ore), and it never writes the kind
+-- switches: it overrides them while on, so turning it off gives the player's
+-- own picks back untouched.
+local AUTO_SKILL = { ore = 186, herb = 182 }  -- Mining, Herbalism
+local AUTO_ORDER = { "ore", "herb" }
+local GATHER_SPELL = { ore = 2575, herb = 2366 }  -- their profession spells, for the names
+
+local function AutoRead()
+    local c = EllesmereUI.CharData("lootSparkles")
+    return c ~= nil and c.auto == true
+end
+
+local function AutoWrite(on)
+    local c = EllesmereUI.CharData("lootSparkles", on)
+    if on then
+        if c then c.auto = true end
+        return
+    end
+    if not c then return end
+    c.auto = nil
+    -- Nothing else of ours is per character: an empty table is not kept.
+    if next(c) == nil then
+        local entry = EllesmereUI.CharEntry(false)
+        if entry then entry.lootSparkles = nil end
+    end
+end
+
+-- Whether this character has the skill line at all (Gathering Skill already
+-- reads the professions this way for its tooltips).
+local function HasSkill(line)
+    return GS ~= nil and GS.Skill ~= nil and GS.Skill(line) ~= nil
+end
+
+-- Whether a kind sparkles now: an ore or herb kind follows the professions
+-- while that is on, every other kind reads its own switch.
+local function KindOn(kind)
+    local line = AUTO_SKILL[kind]
+    if line and AutoRead() then return HasSkill(line) end
+    return F.Get(kind) == true
+end
+
+-- What this character can gather, in the client's own words ("Mining 75,
+-- Herbalism 120"), for the page's note beside the switch.
+local function GatheringText()
+    if not (GS and GS.Skill) then return "" end
+    local parts = {}
+    for i = 1, #AUTO_ORDER do
+        local kind = AUTO_ORDER[i]
+        local rank = GS.Skill(AUTO_SKILL[kind])
+        if rank then
+            local name = C_Spell.GetSpellName(GATHER_SPELL[kind]) or kind
+            parts[#parts + 1] = name .. " " .. rank
+        end
+    end
+    return table.concat(parts, ", ")
+end
+
 local ev = CreateFrame("Frame")      -- every event; inert while the feature is off
 local built = {}                     -- style -> { frame = , layers = { { group, texture } } }
 local onPlate                        -- the box on screen, while one is shown
@@ -277,7 +339,7 @@ end
 local function Evaluate()
     if not F.Enabled() then return end
     local kind = TargetKind()
-    if not (kind and F.Get(kind)) then HideSparkle(); return end
+    if not (kind and KindOn(kind)) then HideSparkle(); return end
     local plate = TargetPlate()
     if not plate then HideSparkle(); return end
     local r, g, b = Colour(kind)
@@ -406,6 +468,8 @@ local WATCH = {
     "LOOT_OPENED",                   -- containers the loot window teaches
     "CVAR_UPDATE",                   -- a graphics preset reset the held CVars
 }
+-- A profession learned or dropped, while the ore and herb kinds follow them.
+local AUTO_WATCH = { "SPELLS_CHANGED", "SKILL_LINES_CHANGED" }
 
 ev:SetScript("OnEvent", function(_, event, arg1)
     if event == "CVAR_UPDATE" then
@@ -414,6 +478,8 @@ ev:SetScript("OnEvent", function(_, event, arg1)
             ReassertLater()
             Evaluate()
         end
+    elseif event == "SPELLS_CHANGED" or event == "SKILL_LINES_CHANGED" then
+        if AutoRead() then Evaluate() end
     elseif event == "LOOT_OPENED" then
         LearnContainers()
         Evaluate()
@@ -542,6 +608,11 @@ local function Apply()
     Prune()
     Hold()
     for i = 1, #WATCH do ev:RegisterEvent(WATCH[i]) end
+    if AutoRead() then
+        for i = 1, #AUTO_WATCH do ev:RegisterEvent(AUTO_WATCH[i]) end
+    else
+        for i = 1, #AUTO_WATCH do ev:UnregisterEvent(AUTO_WATCH[i]) end
+    end
     Evaluate()
 end
 
@@ -554,6 +625,13 @@ EllesmereUI._Sparkles = {
     Refresh = Evaluate,
     STYLE_NAMES = STYLE_NAMES,
     STYLE_ORDER = STYLE_ORDER,
+    -- Following this character's professions: the switch, whether a kind is
+    -- one of the two it follows, and what a kind shows right now.
+    AutoOn = AutoRead,
+    SetAuto = AutoWrite,
+    FollowsProfession = function(kind) return AUTO_SKILL[kind] ~= nil end,
+    KindOn = KindOn,
+    Gathering = GatheringText,
     -- The page's live preview in the content header, and the eye that picks
     -- which kind's colour it shows (nil: no sparkle drawn).
     CreateSettingsPreview = CreateSettingsPreview,

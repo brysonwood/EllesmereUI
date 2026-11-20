@@ -95,12 +95,31 @@ _G._EUI_BuildSparklesPage = function(pageName, parent, yOffset)
         for i = 1, #eyeRefreshes do eyeRefreshes[i]() end
     end
 
+    -- Following this character's professions: the ore and herb switches are
+    -- kept but ignored while it is on, so it is their own row above them. The
+    -- note beside it names the professions it found, so the switches below
+    -- greying makes sense at a glance.
+    local gathered = SP.Gathering()
+    _, h = W:DualRow(parent, y,
+        { type = "toggle", text = "Follow My Professions",
+          tooltip = "Turns the ore and herb sparkles on for the professions this character has: Mining for ore, Herbalism for herbs, off for the one it cannot gather. Your own switches for those two are kept and come back when this is turned off. This character only.",
+          disabled = off, disabledTooltip = "Loot Sparkles",
+          getValue = function() return SP.AutoOn() end,
+          setValue = function(v)
+              SP.SetAuto(v)
+              SP.Apply()
+              EllesmereUI:RefreshPage()  -- the ore and herb rows follow it
+          end },
+        { type = "label", text = (gathered ~= "" and gathered) or "No gathering profession",
+          tooltip = "The gathering professions this character has. The ore and herb sparkles follow them while the switch beside it is on." }
+    );  y = y - h
+
     -- The row's toggle is DualRow's; the swatch and the eye chain left of it.
     -- kind is the settings key, and the kind the colours and the preview use.
     local function AddKindControls(rgn, kind)
         if EllesmereUI._prebuilding or not rgn then return end
         local function live()
-            return not off() and SP.Get(kind) == true
+            return not off() and SP.KindOn(kind) == true
         end
 
         local swatch, updateSwatch = EllesmereUI.BuildColorSwatch(rgn, rgn:GetFrameLevel() + 5,
@@ -158,10 +177,17 @@ _G._EUI_BuildSparklesPage = function(pageName, parent, yOffset)
     end
 
     -- One kind's row entry: its switch, and the controls that go beside it.
+    -- An ore or herb row follows this character's professions while that is
+    -- on: it shows what the profession gives and greys, its own switch kept.
     local function KindCfg(kind, label, tooltip)
+        local follows = SP.FollowsProfession(kind)
         return { type = "toggle", text = label, tooltip = tooltip,
-            disabled = off, disabledTooltip = "Loot Sparkles",
-            getValue = function() return SP.Get(kind) == true end,
+            disabled = function() return off() or (follows and SP.AutoOn()) end,
+            disabledTooltip = function()
+                if off() then return "Loot Sparkles" end
+                return "Follow My Professions"
+            end,
+            getValue = function() return SP.KindOn(kind) == true end,
             setValue = function(v)
                 SP.Cfg()[kind] = v
                 -- A kind switched off leaves the preview, as its eye greys.
