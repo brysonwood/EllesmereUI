@@ -160,6 +160,18 @@ function ns.MicroClickLayer(microName, onClick)
 end
 
 -------------------------------------------------------------------------------
+--  World objects
+-------------------------------------------------------------------------------
+-- The game object ID in a GUID ("GameObject-0-<server>-<instance>-<zone>-<id>-
+-- <spawn>"), or nil. Only the ID field is read: the fields before and after
+-- it may be obfuscated. Fishing reads the bobber this way, the sparkles every
+-- interactable they meet.
+function ns.ObjectID(guid)
+    if not guid or issecretvalue(guid) or type(guid) ~= "string" then return nil end
+    return tonumber(guid:match("^GameObject%-[^-]*%-[^-]*%-[^-]*%-[^-]*%-(%d+)%-"))
+end
+
+-------------------------------------------------------------------------------
 --  Auction prices (Loot Feed, Junk Items)
 -------------------------------------------------------------------------------
 -- Auctionator's API, while that addon is loaded.

@@ -1,0 +1,441 @@
+if EUI_CLIENT_BLOCKED then return end -- pre-12.1 client failsafe (EllesmereUI_ClientGate.lua)
+if not (EllesmereUI and EllesmereUI.IS_FOREVER) then return end
+-------------------------------------------------------------------------------
+--  EllesmereUIForeverEssentials_Sparkles.lua  (WoW Forever only)
+--  Loot Sparkles: whichever ore vein, herb, chest, quest object, lootable body
+--  or fishing bobber the client's interact targeting points at gets a sparkle
+--  in the colour picked for its kind, so it is seen before it is in reach.
+--
+--  Interact targeting is the game's own soft target, the "softinteract" unit:
+--  the client marks one interactable at a time and pins its interact icon to
+--  that unit's nameplate (Blizzard's NamePlateDriverMixin, and the plate's
+--  SoftTargetFrame). The sparkle is a frame parented to that nameplate, so
+--  the client does the following and the hiding, and every motion is an
+--  AnimationGroup: no Lua runs per frame and no timer polls.
+--
+--  A kind is read from the object, never from tooltip text a language or a
+--  player can change: the bobber by its game object ID, chests by the object
+--  IDs the loot window taught, herbs and ore by the node names Gathering
+--  Skill already keeps for every client language, quest objects by the quest
+--  log, and a body by being dead.
+--
+--  The client's soft-target settings are held only while the feature is on
+--  (EllesmereUI.HoldCVar keeps what the player had, ReleaseCVar gives it
+--  back), written out of combat only and written again after a graphics
+--  preset, which resets them.
+-------------------------------------------------------------------------------
+local _, module = ...
+
+local OWNER = "EllesmereUIForeverEssentials"
+-- The unit the client's interact targeting points at, and the plate it marks.
+local TARGET = "softinteract"
+local GLOW = "Interface\\AddOns\\EllesmereUI\\media\\unlock-flash.png"
+local STREAK = "Interface\\AddOns\\EllesmereUI\\media\\cast_spark.tga"
+local STAR = "Interface\\Cooldown\\star4"  -- Blizzard's four-point twinkle
+local BOBBER = 35591
+
+-- The sparkle's box, and how far below the plate's centre it sits: a plate
+-- stands over its unit, a chest or a node has the sparkle over its lid.
+local SIZE = 64
+local OFFSET_Y = -26
+
+-- The kinds and their starting colour, and the four styles. Every kind
+-- starts in the house gold, the colour of the game's loot sparkle (1, 0.82,
+-- 0.30 as elsewhere in the suite); a kind's own swatch overrides it.
+--
+-- A style is a list of layers over one frame: a texture, its size and place
+-- on the frame, and the loop that moves it (alpha/scale = from, to, seconds;
+-- rise = pixels up over the same seconds; turn = the texture's own angle;
+-- delay = seconds before the loop starts; loop = BOUNCE unless given).
+local GOLD = { 1.00, 0.82, 0.30 }
+local COLORS = {
+    ore    = GOLD,
+    herb   = GOLD,
+    chest  = GOLD,
+    quest  = GOLD,
+    corpse = GOLD,
+    bobber = GOLD,
+}
+local STYLES = {
+    glow = {
+        { tex = GLOW, w = 62, h = 62, alpha = { 0.22, 0.58, 1.2 } },
+    },
+    beam = {
+        { tex = GLOW, w = 38, h = 38, y = -18, alpha = { 0.28, 0.58, 1.0 } },
+        { tex = STREAK, w = 10, h = 76, y = 22, alpha = { 0.85, 0, 1.3 }, rise = 64, loop = "REPEAT" },
+    },
+    flare = {
+        { tex = GLOW, w = 54, h = 54, alpha = { 0.18, 0.42, 1.1 } },
+        { tex = STAR, w = 42, h = 42, scale = { 0.55, 1.15, 0.9 }, alpha = { 0.9, 0.15, 0.9 } },
+    },
+    sparkle = {
+        { tex = STAR, w = 26, h = 26, alpha = { 0.85, 0.25, 0.7 } },
+        { tex = STAR, w = 15, h = 15, x = -14, y = 13, alpha = { 0, 0.9, 0.9 }, delay = 0.35, turn = 0.785 },
+        { tex = STAR, w = 13, h = 13, x = 16, y = -11, alpha = { 0, 0.8, 1.1 }, delay = 0.7, turn = 0.785 },
+    },
+}
+local STYLE_NAMES = { glow = "Glow", beam = "Beam", flare = "Flare", sparkle = "Sparkle" }
+local STYLE_ORDER = { "glow", "beam", "flare", "sparkle" }
+
+-- Settings live in EllesmereUIDB.sparkles; unset keys read these: the switch,
+-- the range in yards, the style, one switch per kind, a kind's colour in
+-- colors[kind] = { r, g, b }, and the container object IDs the loot window
+-- taught in containers, which survive a reset so chests stay known.
+local F = module.Feature("sparkles", {
+    enabled = false, range = 15, style = "glow",
+    ore = true, herb = true, chest = true, quest = true, corpse = true, bobber = true,
+})
+
+local GS = EllesmereUI._GatherSkill  -- the node names Gathering Skill keeps
+
+local ev = CreateFrame("Frame")      -- every event; inert while the feature is off
+local built = {}                     -- style -> { frame = , layers = { { group, texture } } }
+local onPlate                        -- the box on screen, while one is shown
+local kindGuid, kindValue            -- the target last classified, and its kind
+
+-------------------------------------------------------------------------------
+--  What the target is
+-------------------------------------------------------------------------------
+-- A kind's colour: the player's own, or the one it starts with.
+local function Colour(kind)
+    local c = F.Read().colors
+    c = c and c[kind]
+    if c and c.r then return c.r, c.g, c.b end
+    c = COLORS[kind]
+    if not c then return 1, 1, 1 end
+    return c[1], c[2], c[3]
+end
+
+-- Whether the quest log ties this unit to a quest the player is on.
+local function QuestRelated(unit)
+    local Q = C_QuestLog
+    if not (Q and Q.UnitIsRelatedToActiveQuest) then return false end
+    local ok, related = pcall(Q.UnitIsRelatedToActiveQuest, unit)
+    return ok and not issecretvalue(related) and related == true
+end
+
+local function IsWorldObject(unit)
+    local isObject = UnitIsGameObject(unit)
+    return not issecretvalue(isObject) and isObject == true
+end
+
+-- The kind of the unit, or nil for something the sparkles leave alone.
+local function Classify(unit, guid)
+    local id = module.ObjectID(guid)
+    if id == BOBBER then return "bobber" end
+    local learned = F.Read().containers
+    if id and learned and learned[id] then return "chest" end
+    if IsWorldObject(unit) then
+        local name = UnitName(unit)
+        if name and not issecretvalue(name) and GS and GS.NodeKind then
+            local node = GS.NodeKind(name)
+            if node then return node end
+        end
+        if QuestRelated(unit) then return "quest" end
+        return nil
+    end
+    -- A creature is worth a sparkle once it is a body to loot. A player's
+    -- corpse is not, and neither is the player's own.
+    local dead = UnitIsDead(unit)
+    if not issecretvalue(dead) and dead == true and not UnitIsPlayer(unit) then return "corpse" end
+end
+
+-- The target's kind, read once per target: a plate comes and goes for every
+-- unit around while the same object stands in front of the player.
+local function TargetKind()
+    local guid = UnitGUID(TARGET)
+    if issecretvalue(guid) then guid = nil end
+    if guid and guid == kindGuid then return kindValue end
+    kindGuid, kindValue = guid, Classify(TARGET, guid)
+    return kindValue
+end
+
+-- The plate the interact target is marked on: its own unit's, or any plate
+-- the client hands out for the same unit.
+local function TargetPlate()
+    local C = C_NamePlate
+    if not (C and C.GetNamePlateForUnit) then return nil end
+    local plate = C.GetNamePlateForUnit(TARGET)
+    if plate then return plate end
+    if not C.GetNamePlates then return nil end
+    local plates = C.GetNamePlates()
+    for i = 1, #plates do
+        local unit = plates[i].namePlateUnitToken
+        if unit and UnitIsUnit(unit, TARGET) then return plates[i] end
+    end
+end
+
+-- A game object the loot window named is a container, whatever the client
+-- calls it: a chest, a crate, a barrel. Learning its ID is what lets the
+-- next one of its kind sparkle before it is opened.
+local function LearnContainers()
+    if not (GetNumLootItems and GetLootSourceInfo) then return end
+    local cfg
+    for slot = 1, GetNumLootItems() or 0 do
+        local id = module.ObjectID(GetLootSourceInfo(slot))
+        if id and id ~= BOBBER then
+            cfg = cfg or F.Cfg()
+            cfg.containers = cfg.containers or {}
+            cfg.containers[id] = true
+        end
+    end
+    if cfg then kindGuid = nil end  -- what was last read may now be a chest
+end
+
+-------------------------------------------------------------------------------
+--  The sparkle
+-------------------------------------------------------------------------------
+-- One layer: a texture on a little frame, moved by a looping group.
+local function BuildLayer(host, spec)
+    local f = CreateFrame("Frame", nil, host)
+    f:SetSize(spec.w, spec.h)
+    f:SetPoint("CENTER", host, "CENTER", spec.x or 0, spec.y or 0)
+    local t = f:CreateTexture(nil, "ARTWORK", nil, 5)
+    t:SetAllPoints(f)
+    t:SetTexture(spec.tex)
+    t:SetBlendMode("ADD")
+    if spec.turn then t:SetRotation(spec.turn) end
+
+    local g = f:CreateAnimationGroup()
+    g:SetLooping(spec.loop or "BOUNCE")
+    local delay = spec.delay or 0
+    local a = spec.alpha
+    if a then
+        f:SetAlpha(a[1])
+        local an = g:CreateAnimation("Alpha")
+        an:SetFromAlpha(a[1])
+        an:SetToAlpha(a[2])
+        an:SetDuration(a[3])
+        an:SetSmoothing("IN_OUT")
+        an:SetStartDelay(delay)
+    end
+    local s = spec.scale
+    if s then
+        local an = g:CreateAnimation("Scale")
+        an:SetScaleFrom(s[1], s[1])
+        an:SetScaleTo(s[2], s[2])
+        an:SetDuration(s[3])
+        an:SetSmoothing("IN_OUT")
+        an:SetStartDelay(delay)
+    end
+    if spec.rise then
+        local an = g:CreateAnimation("Translation")
+        an:SetOffset(0, spec.rise)
+        an:SetDuration(a and a[3] or 1)
+        an:SetSmoothing("OUT")
+        an:SetStartDelay(delay)
+    end
+    return { frame = f, group = g, texture = t }
+end
+
+-- A style's box, built on first use and kept: switching styles back and
+-- forth costs nothing after the first time.
+local function BoxFor(style)
+    local box = built[style]
+    if box then return box end
+    local host = CreateFrame("Frame", nil, UIParent)
+    host:SetSize(SIZE, SIZE)
+    host:EnableMouse(false)
+    -- The plate the box hangs on shrinks with distance; the sparkle is a
+    -- world object at a fixed size, so it is not drawn at the plate's scale.
+    if host.SetIgnoreParentScale then host:SetIgnoreParentScale(true) end
+    host:Hide()
+    box = { frame = host, layers = {} }
+    local specs = STYLES[style] or STYLES.glow
+    for i = 1, #specs do box.layers[i] = BuildLayer(host, specs[i]) end
+    built[style] = box
+    return box
+end
+
+local function StopBox(box)
+    for i = 1, #box.layers do box.layers[i].group:Stop() end
+    box.frame:Hide()
+    box.playing = false
+end
+
+local function HideSparkle()
+    if onPlate then StopBox(onPlate) end
+    onPlate = nil
+end
+
+local function ShowSparkle(plate, style, r, g, b)
+    local box = BoxFor(style)
+    if onPlate and onPlate ~= box then StopBox(onPlate) end
+    if box.frame:GetParent() ~= plate then box.frame:SetParent(plate) end
+    box.frame:ClearAllPoints()
+    box.frame:SetPoint("CENTER", plate, "CENTER", 0, OFFSET_Y)
+    for i = 1, #box.layers do box.layers[i].texture:SetVertexColor(r, g, b) end
+    box.frame:Show()
+    if not box.playing then
+        box.playing = true
+        for i = 1, #box.layers do box.layers[i].group:Play() end
+    end
+    onPlate = box
+end
+
+-- Reads the target and draws, moves or takes away the sparkle.
+local function Evaluate()
+    if not F.Enabled() then return end
+    local kind = TargetKind()
+    if not (kind and F.Get(kind)) then HideSparkle(); return end
+    local plate = TargetPlate()
+    if not plate then HideSparkle(); return end
+    local r, g, b = Colour(kind)
+    ShowSparkle(plate, F.Get("style"), r, g, b)
+end
+
+-- The plate can arrive a moment after the target it belongs to: one more
+-- look shortly after a target change, and only while nothing is drawn.
+local looking = false
+local function EvaluateSoon()
+    if looking then return end
+    looking = true
+    C_Timer.After(0.15, function()
+        looking = false
+        Evaluate()
+    end)
+end
+
+-------------------------------------------------------------------------------
+--  Held CVars
+-------------------------------------------------------------------------------
+-- The client's soft-target settings: targeting on for both input styles
+-- (Enum.SoftTargetEnableFlags.Any, the value the Fishing key sets), its
+-- reach and arc, and targets kept out of reach as well, so an object is
+-- marked before it can be used.
+local function Wanted()
+    local range = F.Get("range")
+    return {
+        softTargetInteract = 3,
+        SoftTargetInteractRange = range,
+        SoftTargetInteractArc = 2,
+        SoftTargetInteractOnlyInRange = 0,
+        SoftTargetInteractRangeIsHard = 0,
+    }
+end
+
+-- Takes the holds, remembering what each CVar was before the first hold.
+-- A CVar the client does not know, or one already at the wanted value, is
+-- left alone.
+local function Hold()
+    local cfg = F.Cfg()
+    local was = cfg.held or {}
+    cfg.held = was
+    for name, value in pairs(Wanted()) do
+        local want = tostring(value)
+        local cur = C_CVar.GetCVar(name)
+        if cur ~= nil and cur ~= want then
+            if EllesmereUI.HoldCVar(name, want, OWNER) and was[name] == nil then was[name] = cur end
+        end
+    end
+end
+
+local function Release()
+    local held = F.Read().held
+    if not held then return end
+    for name, value in pairs(held) do
+        EllesmereUI.ReleaseCVar(name, value, OWNER)
+    end
+    F.Cfg().held = nil
+end
+
+-- A graphics preset puts the client's own values back: write the held names
+-- again (only those, so a player's change to anything else stands).
+local function Reassert()
+    local held = F.Read().held
+    if not held then return end
+    local values = Wanted()
+    for name in pairs(held) do
+        local want = values[name]
+        if want ~= nil and C_CVar.GetCVar(name) ~= tostring(want) then
+            EllesmereUI.HoldCVar(name, tostring(want), OWNER)
+        end
+    end
+end
+
+local function ReassertLater()
+    if InCombatLockdown() then
+        EllesmereUI.CombatQueue.Defer("SparklesCVars", Reassert)
+        return
+    end
+    Reassert()
+end
+
+-------------------------------------------------------------------------------
+--  Events
+-------------------------------------------------------------------------------
+local WATCH = {
+    "PLAYER_SOFT_INTERACT_CHANGED",  -- the target moved: the sparkle follows it
+    "NAME_PLATE_UNIT_ADDED",         -- the plate the sparkle hangs on
+    "NAME_PLATE_UNIT_REMOVED",
+    "PLAYER_ENTERING_WORLD",
+    "LOOT_OPENED",                   -- containers the loot window teaches
+    "CVAR_UPDATE",                   -- a graphics preset reset the held CVars
+}
+
+ev:SetScript("OnEvent", function(_, event, arg1)
+    if event == "CVAR_UPDATE" then
+        local changed = type(arg1) == "string" and arg1:lower()
+        if changed == "graphicsquality" or changed == "raidgraphicsquality" then
+            ReassertLater()
+            Evaluate()
+        end
+    elseif event == "LOOT_OPENED" then
+        LearnContainers()
+        Evaluate()
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        ReassertLater()
+        Evaluate()
+    elseif event == "PLAYER_SOFT_INTERACT_CHANGED" then
+        Evaluate()
+        if not onPlate then EvaluateSoon() end
+    else
+        Evaluate()
+    end
+end)
+
+-------------------------------------------------------------------------------
+--  Apply
+-------------------------------------------------------------------------------
+-- Login and the options; takes effect at once in both directions. The CVars
+-- only change out of combat: in combat the apply waits for its end.
+local booted = false
+local function Apply()
+    if InCombatLockdown() then
+        EllesmereUI.CombatQueue.Defer("Sparkles", Apply)
+        return
+    end
+    if not booted then
+        -- Whatever a reload or a disconnect left held goes back first.
+        booted = true
+        Release()
+    end
+    if not F.Enabled() then
+        HideSparkle()
+        Release()
+        ev:UnregisterAllEvents()
+        return
+    end
+    Hold()
+    for i = 1, #WATCH do ev:RegisterEvent(WATCH[i]) end
+    Evaluate()
+end
+
+-- Options-page entry points.
+EllesmereUI._Sparkles = {
+    Get = F.Get,
+    Cfg = F.Cfg,
+    Apply = Apply,
+    Color = Colour,
+    Refresh = Evaluate,
+    STYLE_NAMES = STYLE_NAMES,
+    STYLE_ORDER = STYLE_ORDER,
+    SetColor = function(kind, r, g, b)
+        local cfg = F.Cfg()
+        cfg.colors = cfg.colors or {}
+        cfg.colors[kind] = { r = r, g = g, b = b }
+        Evaluate()
+    end,
+}
+
+F.Start(Apply)

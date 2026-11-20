@@ -134,13 +134,9 @@ local function BestLure()
     end
 end
 
--- The game object ID in a "GameObject-0-...-35591-..." GUID, or nil.
-local function ObjectID(guid)
-    if not guid or issecretvalue(guid) then return nil end
-    -- Only the object's ID field is read: the server and spawn fields before
-    -- and after it may be obfuscated.
-    return tonumber(guid:match("^GameObject%-[^-]*%-[^-]*%-[^-]*%-[^-]*%-(%d+)%-"))
-end
+-- The game object ID in the target's GUID (the module's reader, shared with
+-- the sparkles).
+local ObjectID = module.ObjectID
 
 -------------------------------------------------------------------------------
 --  Held CVars

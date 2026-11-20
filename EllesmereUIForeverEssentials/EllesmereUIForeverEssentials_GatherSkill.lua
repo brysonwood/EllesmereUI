@@ -103,6 +103,17 @@ events:SetScript("OnEvent", function(self, _, itemID, success)
     end
 end)
 
+-- "herb" or "ore" for a node name as the client shows it, nil for any other
+-- name: the lookup the tooltips use, read by the loot sparkles so a node is
+-- recognised the same way in every client language. Built on first use.
+local function NodeKind(name)
+    if type(name) ~= "string" then return nil end
+    if not nodes then Build() end
+    local node = nodes[Key(name)]
+    if not node then return nil end
+    return node[1] == MINING and "ore" or "herb"
+end
+
 -- The player's skill in a gathering skill line, nil without it.
 local function Skill(line)
     for _, index in ipairs({ GetProfessions() }) do
@@ -210,6 +221,7 @@ EllesmereUI._GatherSkill = {
     Get = F.Get,
     Cfg = F.Cfg,
     Apply = Apply,
+    NodeKind = NodeKind,
 }
 
 F.Start(Apply)
