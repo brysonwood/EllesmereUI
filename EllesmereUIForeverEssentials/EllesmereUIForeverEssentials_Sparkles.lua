@@ -194,12 +194,14 @@ local function IsWorldObject(unit)
     return not issecretvalue(isObject) and isObject == true
 end
 
--- The kind of the unit, or nil for something the sparkles leave alone.
+-- The kind of the unit, or nil for something the sparkles leave alone. What
+-- the object says it is comes first, and what the loot window taught is the
+-- last word only for an object it says nothing about: a vein or a herb that
+-- was harvested opens a loot window on the client, and that must not make
+-- every node of its kind a chest, nor take a quest object's own colour.
 local function Classify(unit, guid)
     local id = module.ObjectID(guid)
     if id == BOBBER then return "bobber" end
-    local learned = F.Read().containers
-    if id and learned and learned[id] then return "chest" end
     if IsWorldObject(unit) then
         local name = UnitName(unit)
         if name and not issecretvalue(name) and GS and GS.NodeKind then
@@ -207,6 +209,8 @@ local function Classify(unit, guid)
             if node then return node end
         end
         if QuestRelated(unit) then return "quest" end
+        local learned = F.Read().containers
+        if id and learned and learned[id] then return "chest" end
         return nil
     end
     -- A creature is worth a sparkle once it is a body to loot. A player's
