@@ -431,20 +431,37 @@ local function Wanted()
     return want
 end
 
+-- The reach the client actually took, when it took less than the slider asked
+-- for (a clamped or refused CVar keeps its own value). The page shows this
+-- instead of the wish, so the slider never promises a distance the game does
+-- not mark.
+local learnedReach
+
+local function RangeReach()
+    local range = F.Get("range")
+    if learnedReach and learnedReach < range then return learnedReach end
+    return range
+end
+
 -- Takes the holds, remembering what each CVar was before the first hold.
 -- A CVar the client does not know, or one already at the wanted value, is
--- left alone.
+-- left alone. Returns what the two distance CVars hold afterwards, which is
+-- what the client will actually use.
 local function Hold()
     local cfg = F.Cfg()
     local was = cfg.held or {}
     cfg.held = was
+    local took = {}
     for name, value in pairs(Wanted()) do
         local want = tostring(value)
         local cur = C_CVar.GetCVar(name)
         if cur ~= nil and cur ~= want then
-            if EllesmereUI.HoldCVar(name, want, OWNER) and was[name] == nil then was[name] = cur end
+            local ok = EllesmereUI.HoldCVar(name, want, OWNER)
+            if ok and was[name] == nil then was[name] = cur end
         end
+        if cur ~= nil then took[name] = tonumber(C_CVar.GetCVar(name)) or tonumber(cur) end
     end
+    return took
 end
 
 -- A hold the settings no longer want goes back to the player's value at once,
@@ -638,11 +655,20 @@ local function Apply()
     if not F.Enabled() then
         HideSparkle()
         Release()
+        learnedReach = nil
         ev:UnregisterAllEvents()
         return
     end
     Prune()
-    Hold()
+    -- What the client took, not what was asked: a clamped or refused CVar
+    -- keeps its own reach, and that is the distance the game will mark.
+    local took = Hold() or {}
+    local range = F.Get("range")
+    local reach
+    local interact, plate = took.SoftTargetInteractRange, took.nameplateMaxDistance
+    if interact and interact < range then reach = interact end
+    if plate and plate < range and (not reach or plate < reach) then reach = plate end
+    learnedReach = reach
     for i = 1, #WATCH do ev:RegisterEvent(WATCH[i]) end
     if AutoRead() then
         for i = 1, #AUTO_WATCH do ev:RegisterEvent(AUTO_WATCH[i]) end
@@ -672,6 +698,10 @@ EllesmereUI._Sparkles = {
     -- whether that leaves nothing to sparkle.
     RespectInteract = RespectInteract,
     InteractOff = InteractOff,
+    -- The reach the client really marks a target at, and the value it kept when
+    -- that is shorter than the setting, for the page's note.
+    RangeReach = RangeReach,
+    RangeLearned = function() return learnedReach end,
     -- Each kind's own effect, and the picker that sets it.
     Effect = EffectFor,
     SetEffect = function(kind, style)

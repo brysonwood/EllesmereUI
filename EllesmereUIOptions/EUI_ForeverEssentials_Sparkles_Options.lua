@@ -39,6 +39,10 @@ _G._EUI_BuildSparklesPage = function(pageName, parent, yOffset)
         SP.Apply()
     end
 
+    -- What the client took for the reach when this page was built, so the
+    -- range row can tell when the answer needs the page again.
+    local builtReach = SP.RangeLearned()
+
     -- The page's first line, as the Friendly Plates page has its instance note:
     -- the sparkle sits on the plate of the game's interact target, so interact
     -- targeting has to be on, and this says who turns it on.
@@ -69,11 +73,27 @@ _G._EUI_BuildSparklesPage = function(pageName, parent, yOffset)
           end },
         { type = "slider", text = "Sparkle Range",
           min = 15, max = 40, step = 1, isPercent = false,
-          tooltip = "How many yards away an object still sparkles. The game hands out a nameplate only within its own nameplate distance, so a target it does not mark cannot be reached.",
+          tooltip = "How many yards away an object still sparkles. The game marks an interactable only as far as its own interact range and nameplate distance reach, and says so below the slider when that is shorter.",
           disabled = off, disabledTooltip = "Loot Sparkles",
           getValue = function() return SP.Get("range") end,
-          setValue = function(v) Set("range", v) end }
+          setValue = function(v)
+              SP.Cfg().range = v
+              SP.Apply()
+              -- The note below is built from what the client took, so the page
+              -- is rebuilt only when that answer changes, not on every step of
+              -- a drag.
+              if SP.RangeLearned() ~= builtReach then EllesmereUI:RefreshPage() end
+          end }
     );  y = y - h
+
+    -- The game's own ceiling, whenever it is under the setting: the slider
+    -- says what was asked for, this says what the client gives.
+    local reach = SP.RangeLearned()
+    if reach and reach < SP.Get("range") then
+        y = EllesmereUI.BuildNoteRow(parent, y,
+            ("The game marks an interactable only within %d yards here, so a longer Sparkle Range is not used."):format(math.floor(reach)),
+            { warn = true })
+    end
 
     local styleValues, styleOrder = {}, {}
     for i = 1, #SP.STYLE_ORDER do
