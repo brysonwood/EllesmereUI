@@ -70,31 +70,6 @@ _G._EUI_BuildSparklesPage = function(pageName, parent, yOffset)
         styleOrder[i] = key
     end
 
-    _, h = W:DualRow(parent, y,
-        { type = "dropdown", text = "Sparkle Style",
-          values = styleValues, order = styleOrder,
-          tooltip = "How the sparkle moves: a soft glow, a rising beam, a flaring star, or stars twinkling.",
-          disabled = off, disabledTooltip = "Loot Sparkles",
-          getValue = function() return SP.Get("style") end,
-          setValue = function(v)
-              SP.Cfg().style = v
-              SP.Refresh()
-              SP.RefreshPreview()
-          end },
-        { type = "toggle", text = "Hide the Game's Loot Sparkle",
-          tooltip = "Turns off the game's own sparkle on lootable bodies and quest objects, so the sparkle here is the only one. The game shares that setting with every loot effect it draws, so anything not sparkled here loses it too.",
-          disabled = off, disabledTooltip = "Loot Sparkles",
-          getValue = function() return SP.Get("hideGameSparkle") == true end,
-          setValue = function(v) Set("hideGameSparkle", v) end }
-    );  y = y - h
-
-    -- Every row's eye is repainted when one of them is picked, so only the lit
-    -- one shows an open eye.
-    local eyeRefreshes = {}
-    local function RefreshEyes()
-        for i = 1, #eyeRefreshes do eyeRefreshes[i]() end
-    end
-
     -- Following this character's professions: the ore and herb switches are
     -- kept but ignored while it is on, so it is their own row above them. The
     -- note beside it names the professions it found, so the switches below
@@ -113,6 +88,23 @@ _G._EUI_BuildSparklesPage = function(pageName, parent, yOffset)
         { type = "label", text = (gathered ~= "" and gathered) or "No gathering profession",
           tooltip = "The gathering professions this character has. The ore and herb sparkles follow them while the switch beside it is on." }
     );  y = y - h
+
+    -- The last row of the section, so its empty slot is allowed.
+    _, h = W:DualRow(parent, y,
+        { type = "toggle", text = "Hide the Game's Loot Sparkle",
+          tooltip = "Turns off the game's own sparkle on lootable bodies and quest objects, so the sparkle here is the only one. The game shares that setting with every loot effect it draws, so anything not sparkled here loses it too.",
+          disabled = off, disabledTooltip = "Loot Sparkles",
+          getValue = function() return SP.Get("hideGameSparkle") == true end,
+          setValue = function(v) Set("hideGameSparkle", v) end },
+        EllesmereUI.BlankRowCfg()
+    );  y = y - h
+
+    -- Every row's eye is repainted when one of them is picked, so only the lit
+    -- one shows an open eye.
+    local eyeRefreshes = {}
+    local function RefreshEyes()
+        for i = 1, #eyeRefreshes do eyeRefreshes[i]() end
+    end
 
     -- The row's toggle is DualRow's; the swatch and the eye chain left of it.
     -- kind is the settings key, and the kind the colours and the preview use.
@@ -176,27 +168,10 @@ _G._EUI_BuildSparklesPage = function(pageName, parent, yOffset)
         end)
     end
 
-    -- One kind's row entry: its switch, and the controls that go beside it.
-    -- An ore or herb row follows this character's professions while that is
-    -- on: it shows what the profession gives and greys, its own switch kept.
-    local function KindCfg(kind, label, tooltip)
-        local follows = SP.FollowsProfession(kind)
-        return { type = "toggle", text = label, tooltip = tooltip,
-            disabled = function() return off() or (follows and SP.AutoOn()) end,
-            disabledTooltip = function()
-                if off() then return "Loot Sparkles" end
-                return "Follow My Professions"
-            end,
-            getValue = function() return SP.KindOn(kind) == true end,
-            setValue = function(v)
-                SP.Cfg()[kind] = v
-                -- A kind switched off leaves the preview, as its eye greys.
-                if not v and SP.PreviewKind() == kind then SP.SetPreviewKind(nil) end
-                SP.Refresh()
-                RefreshEyes()
-            end }
-    end
-
+    -- One kind's row: its switch (with the swatch and the preview eye beside
+    -- it) on the left, its own effect on the right. An ore or herb row follows
+    -- this character's professions while that is on: it shows what the
+    -- profession gives and greys, its own switch kept.
     local KIND_ROWS = {
         { "ore", "Ore Veins", "Ore veins, in the color you pick." },
         { "herb", "Herbs", "Herbs, in the color you pick." },
@@ -205,17 +180,38 @@ _G._EUI_BuildSparklesPage = function(pageName, parent, yOffset)
         { "corpse", "Dead Bodies", "Creatures that are down. Turn the game's own loot sparkle off above to see this one alone." },
         { "bobber", "Fishing Bobber", "Your fishing bobber, whenever the game's targeting picks it up." },
     }
-    local BLANK = EllesmereUI.BlankRowCfg
-    for i = 1, #KIND_ROWS, 2 do
-        local left = KIND_ROWS[i]
-        local right = KIND_ROWS[i + 1]
+
+    -- The effect is each kind's own, so a body can wear a beam while ore wears
+    -- a glow. It is the sample the top of the page draws, too.
+    _, h = W:SectionHeader(parent, "WHAT SPARKLES", y);  y = y - h
+
+    for i = 1, #KIND_ROWS do
+        local kind, label, tooltip = KIND_ROWS[i][1], KIND_ROWS[i][2], KIND_ROWS[i][3]
+        local follows = SP.FollowsProfession(kind)
         local row
         row, h = W:DualRow(parent, y,
-            KindCfg(left[1], left[2], left[3]),
-            right and KindCfg(right[1], right[2], right[3]) or BLANK()
+            { type = "toggle", text = label, tooltip = tooltip,
+              disabled = function() return off() or (follows and SP.AutoOn()) end,
+              disabledTooltip = function()
+                  if off() then return "Loot Sparkles" end
+                  return "Follow My Professions"
+              end,
+              getValue = function() return SP.KindOn(kind) == true end,
+              setValue = function(v)
+                  SP.Cfg()[kind] = v
+                  -- A kind switched off leaves the preview, as its eye greys.
+                  if not v and SP.PreviewKind() == kind then SP.SetPreviewKind(nil) end
+                  SP.Refresh()
+                  RefreshEyes()
+              end },
+            { type = "dropdown", text = "Effect",
+              values = styleValues, order = styleOrder,
+              tooltip = "How this kind's sparkle moves: a soft glow, a rising beam, a flaring star, or stars twinkling.",
+              disabled = off, disabledTooltip = "Loot Sparkles",
+              getValue = function() return SP.Effect(kind) end,
+              setValue = function(v) SP.SetEffect(kind, v) end }
         );  y = y - h
-        AddKindControls(row._leftRegion, left[1])
-        if right then AddKindControls(row._rightRegion, right[1]) end
+        AddKindControls(row._leftRegion, kind)
     end
 
     return math.abs(y)

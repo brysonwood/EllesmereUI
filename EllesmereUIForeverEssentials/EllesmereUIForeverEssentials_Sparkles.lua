@@ -27,8 +27,10 @@ if not (EllesmereUI and EllesmereUI.IS_FOREVER) then return end
 local _, module = ...
 
 local OWNER = "EllesmereUIForeverEssentials"
--- The unit the client's interact targeting points at, and the plate it marks.
+-- The units the client's targeting points at: the interact target, and the
+-- enemy target a body can be given instead of one.
 local TARGET = "softinteract"
+local FOE = "softenemy"
 local GLOW = "Interface\\AddOns\\EllesmereUI\\media\\unlock-flash.png"
 local STREAK = "Interface\\AddOns\\EllesmereUI\\media\\cast_spark.tga"
 local STAR = "Interface\\Cooldown\\star4"  -- Blizzard's four-point twinkle
@@ -126,6 +128,18 @@ local function HasSkill(line)
     return GS ~= nil and GS.Skill ~= nil and GS.Skill(line) ~= nil
 end
 
+-- A kind's own effect. A kind that has never been picked follows the one
+-- setting the page used to write, so a choice made there still holds
+-- everywhere; every kind writes its own from then on.
+local function EffectFor(kind)
+    local e = F.Read().effects
+    e = e and e[kind]
+    if e and STYLES[e] then return e end
+    local fallback = F.Get("style")
+    if STYLES[fallback] then return fallback end
+    return "glow"
+end
+
 -- Whether a kind sparkles now: an ore or herb kind follows the professions
 -- while that is on, every other kind reads its own switch.
 local function KindOn(kind)
@@ -153,7 +167,6 @@ end
 local ev = CreateFrame("Frame")      -- every event; inert while the feature is off
 local built = {}                     -- style -> { frame = , layers = { { group, texture } } }
 local onPlate                        -- the box on screen, while one is shown
-local kindGuid, kindValue            -- the target last classified, and its kind
 
 -------------------------------------------------------------------------------
 --  What the target is
@@ -202,28 +215,32 @@ local function Classify(unit, guid)
     if not issecretvalue(dead) and dead == true and not UnitIsPlayer(unit) then return "corpse" end
 end
 
--- The target's kind, read once per target: a plate comes and goes for every
--- unit around while the same object stands in front of the player.
-local function TargetKind()
-    local guid = UnitGUID(TARGET)
+-- The kind of a token's unit, read once per unit it names: a plate comes and
+-- goes for every unit around while the same object stands in front of the
+-- player, so the reading is kept until the token names another unit.
+local cachedKinds = {}  -- token -> { guid = , kind = }
+local function KindAt(unit)
+    local guid = UnitGUID(unit)
     if issecretvalue(guid) then guid = nil end
-    if guid and guid == kindGuid then return kindValue end
-    kindGuid, kindValue = guid, Classify(TARGET, guid)
-    return kindValue
+    local c = cachedKinds[unit]
+    if c and guid and c.guid == guid then return c.kind end
+    local kind = Classify(unit, guid)
+    cachedKinds[unit] = { guid = guid, kind = kind }
+    return kind
 end
 
--- The plate the interact target is marked on: its own unit's, or any plate
--- the client hands out for the same unit.
-local function TargetPlate()
+-- The plate a unit is marked on: its own token's, or any plate the client
+-- hands out for the same unit.
+local function TargetPlate(unit)
     local C = C_NamePlate
     if not (C and C.GetNamePlateForUnit) then return nil end
-    local plate = C.GetNamePlateForUnit(TARGET)
+    local plate = C.GetNamePlateForUnit(unit)
     if plate then return plate end
     if not C.GetNamePlates then return nil end
     local plates = C.GetNamePlates()
     for i = 1, #plates do
-        local unit = plates[i].namePlateUnitToken
-        if unit and UnitIsUnit(unit, TARGET) then return plates[i] end
+        local token = plates[i].namePlateUnitToken
+        if token and UnitIsUnit(token, unit) then return plates[i] end
     end
 end
 
@@ -241,7 +258,7 @@ local function LearnContainers()
             cfg.containers[id] = true
         end
     end
-    if cfg then kindGuid = nil end  -- what was last read may now be a chest
+    if cfg then cachedKinds = {} end  -- what was last read may now be a chest
 end
 
 -------------------------------------------------------------------------------
@@ -338,12 +355,17 @@ end
 -- Reads the target and draws, moves or takes away the sparkle.
 local function Evaluate()
     if not F.Enabled() then return end
-    local kind = TargetKind()
+    local unit, kind = TARGET, KindAt(TARGET)
+    if not kind then
+        -- A body the client counts as an enemy target rather than an interact
+        -- one is still a body to loot (only a dead one classifies as a body).
+        unit, kind = FOE, KindAt(FOE)
+    end
     if not (kind and KindOn(kind)) then HideSparkle(); return end
-    local plate = TargetPlate()
+    local plate = TargetPlate(unit)
     if not plate then HideSparkle(); return end
     local r, g, b = Colour(kind)
-    ShowSparkle(plate, F.Get("style"), r, g, b)
+    ShowSparkle(plate, EffectFor(kind), r, g, b)
 end
 
 -- The plate can arrive a moment after the target it belongs to: one more
@@ -532,7 +554,8 @@ local function RefreshPreview()
     if not v then return end
     local kind = previewKind
     v.name:SetText(kind and PREVIEW_NAMES[kind] or "")
-    PreviewStyle(F.Get("style"))
+    -- The sample wears the previewed kind's own effect, as the world does.
+    PreviewStyle(kind and EffectFor(kind) or F.Get("style"))
     local r, g, b = 1, 1, 1
     if kind then r, g, b = Colour(kind) end
     local on = kind ~= nil
@@ -632,6 +655,15 @@ EllesmereUI._Sparkles = {
     FollowsProfession = function(kind) return AUTO_SKILL[kind] ~= nil end,
     KindOn = KindOn,
     Gathering = GatheringText,
+    -- Each kind's own effect, and the picker that sets it.
+    Effect = EffectFor,
+    SetEffect = function(kind, style)
+        local cfg = F.Cfg()
+        cfg.effects = cfg.effects or {}
+        cfg.effects[kind] = style
+        Evaluate()
+        if previewKind == kind then RefreshPreview() end
+    end,
     -- The page's live preview in the content header, and the eye that picks
     -- which kind's colour it shows (nil: no sparkle drawn).
     CreateSettingsPreview = CreateSettingsPreview,
