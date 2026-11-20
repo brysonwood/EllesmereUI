@@ -35,6 +35,9 @@ local GLOW = "Interface\\AddOns\\EllesmereUI\\media\\unlock-flash.png"
 local STREAK = "Interface\\AddOns\\EllesmereUI\\media\\cast_spark.tga"
 local STAR = "Interface\\Cooldown\\star4"  -- Blizzard's four-point twinkle
 local BOBBER = 35591
+-- The nameplate tokens a client numbers its plates by, when it hands out no
+-- list of them (a client that does is read from the list instead).
+local PLATE_MAX = 40
 
 -- The sparkle's box, and how far below the plate's centre it sits: a plate
 -- stands over its unit, a chest or a node has the sparkle over its lid.
@@ -251,6 +254,16 @@ local function KindAt(unit)
     return kind
 end
 
+-- The unit a plate stands for. The client names it on the plate; a client
+-- that does not is asked for the token its plates are numbered by.
+local function PlateToken(plate, i)
+    local token = plate.namePlateUnitToken
+    if token then return token end
+    token = "nameplate" .. i
+    if UnitExists and not UnitExists(token) then return nil end
+    return token
+end
+
 -- The plate a unit is marked on: its own token's, or any plate the client
 -- hands out for the same unit.
 local function TargetPlate(unit)
@@ -261,7 +274,7 @@ local function TargetPlate(unit)
     if not C.GetNamePlates then return nil end
     local plates = C.GetNamePlates()
     for i = 1, #plates do
-        local token = plates[i].namePlateUnitToken
+        local token = PlateToken(plates[i], i)
         if token and UnitIsUnit(token, unit) then return plates[i] end
     end
 end
@@ -277,23 +290,26 @@ end
 -- A body to sparkle, and the plate it stands on. The client's targeting marks
 -- what can be used, and a corpse cannot be used, so a body is not marked
 -- there: it is the nearest dead creature on a plate, within the sparkle's
--- range when that can be measured.
+-- range when that can be measured. A client that hands out no plate list is
+-- asked for the tokens its plates are numbered by.
 local function BodyOnPlates()
     local C = C_NamePlate
-    if not (C and C.GetNamePlates) then return nil end
+    local plates = C and C.GetNamePlates and C.GetNamePlates()
     local range = F.Get("range")
     local limit = range * range
     local token, plate, near
-    local plates = C.GetNamePlates()
-    for i = 1, #plates do
-        local at = plates[i].namePlateUnitToken
-        if at and LootableBody(at) then
-            local d = DistanceSq(at)
-            if not d or d <= limit then
-                if not token or (d and (not near or d < near)) then
-                    token, plate, near = at, plates[i], d
-                end
-            end
+    local function Consider(at, pl)
+        if not (at and LootableBody(at)) then return end
+        local d = DistanceSq(at)
+        if d and d > limit then return end
+        if not token or (d and (not near or d < near)) then token, plate, near = at, pl, d end
+    end
+    if plates then
+        for i = 1, #plates do Consider(PlateToken(plates[i], i), plates[i]) end
+    elseif C and C.GetNamePlateForUnit then
+        for i = 1, PLATE_MAX do
+            local at = "nameplate" .. i
+            if UnitExists and UnitExists(at) then Consider(at, C.GetNamePlateForUnit(at)) end
         end
     end
     return token, plate
@@ -575,6 +591,7 @@ local WATCH = {
     "PLAYER_SOFT_INTERACT_CHANGED",  -- the target moved: the sparkle follows it
     "NAME_PLATE_UNIT_ADDED",         -- the plate the sparkle hangs on
     "NAME_PLATE_UNIT_REMOVED",
+    "UNIT_DIED",                     -- a plate already up turns into a body
     "PLAYER_ENTERING_WORLD",
     "LOOT_OPENED",                   -- containers the loot window teaches
     "CVAR_UPDATE",                   -- a graphics preset reset the held CVars
@@ -598,6 +615,12 @@ ev:SetScript("OnEvent", function(_, event, arg1)
         ReassertLater()
         Evaluate()
     elseif event == "PLAYER_SOFT_INTERACT_CHANGED" then
+        Evaluate()
+        if not onPlate then EvaluateSoon() end
+    elseif event == "UNIT_DIED" then
+        -- The plate was already up, so nothing else said the unit changed:
+        -- the death itself is the news, and one more look shortly after, as
+        -- the plate takes the body's state a moment later.
         Evaluate()
         if not onPlate then EvaluateSoon() end
     else
