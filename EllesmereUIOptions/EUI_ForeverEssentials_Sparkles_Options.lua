@@ -39,10 +39,22 @@ _G._EUI_BuildSparklesPage = function(pageName, parent, yOffset)
         SP.Apply()
     end
 
+    -- The page's first line, as the Friendly Plates page has its instance note:
+    -- the sparkle sits on the plate of the game's interact target, so interact
+    -- targeting has to be on, and this says who turns it on.
+    local note
+    if SP.RespectInteract() then
+        note = SP.InteractOff()
+            and "Interact Key is off in Options > Controls: nothing will sparkle until you turn it on."
+            or "The Interact Key setting is left as you set it."
+    else
+        note = "Loot Sparkles turns the game's Interact Key on while it is enabled, and puts your own setting back when it is off."
+    end
+    y = EllesmereUI.BuildNoteRow(parent, y, note, { warn = true })
+
     ---------------------------------------------------------------------------
-    --  LOOT SPARKLES: the switch and the range it reaches, then the style and
-    --  the game's own sparkle, then a switch with a swatch and a preview eye
-    --  for each kind.
+    --  LOOT SPARKLES: the switch and the range it reaches, the profession
+    --  switch, then the game's own sparkle and the Interact Key choice.
     ---------------------------------------------------------------------------
     hdr, h = W:SectionHeader(parent, "LOOT SPARKLES", y);  y = y - h
 
@@ -89,14 +101,22 @@ _G._EUI_BuildSparklesPage = function(pageName, parent, yOffset)
           tooltip = "The gathering professions this character has. The ore and herb sparkles follow them while the switch beside it is on." }
     );  y = y - h
 
-    -- The last row of the section, so its empty slot is allowed.
+    -- The game's own sparkle, and whether the Interact Key is ours to turn on.
     _, h = W:DualRow(parent, y,
         { type = "toggle", text = "Hide the Game's Loot Sparkle",
           tooltip = "Turns off the game's own sparkle on lootable bodies and quest objects, so the sparkle here is the only one. The game shares that setting with every loot effect it draws, so anything not sparkled here loses it too.",
           disabled = off, disabledTooltip = "Loot Sparkles",
           getValue = function() return SP.Get("hideGameSparkle") == true end,
           setValue = function(v) Set("hideGameSparkle", v) end },
-        EllesmereUI.BlankRowCfg()
+        { type = "toggle", text = "Leave My Interact Key Alone",
+          tooltip = "Never changes the game's Interact Key setting. The sparkle sits on the plate of the interact target, so with this on it appears only while you have Interact Key turned on yourself (Options > Controls); with it off, turning Loot Sparkles on turns the key on and turning it off puts your setting back.",
+          disabled = off, disabledTooltip = "Loot Sparkles",
+          getValue = function() return SP.RespectInteract() end,
+          setValue = function(v)
+              SP.Cfg().respectInteract = v
+              SP.Apply()
+              EllesmereUI:RefreshPage()  -- the note at the top reads the new choice
+          end }
     );  y = y - h
 
     -- Every row's eye is repainted when one of them is picked, so only the lit

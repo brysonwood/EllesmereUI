@@ -84,7 +84,7 @@ local STYLE_ORDER = { "glow", "beam", "flare", "sparkle" }
 -- colors[kind] = { r, g, b }, and the container object IDs the loot window
 -- taught in containers, which survive a reset so chests stay known.
 local F = module.Feature("sparkles", {
-    enabled = false, range = 15, style = "glow", hideGameSparkle = false,
+    enabled = false, range = 15, style = "glow", hideGameSparkle = false, respectInteract = false,
     ore = true, herb = true, chest = true, quest = true, corpse = true, bobber = true,
 })
 
@@ -400,16 +400,29 @@ end
 -- The client's soft-target settings: targeting on for both input styles
 -- (Enum.SoftTargetEnableFlags.Any, the value the Fishing key sets), its
 -- reach and arc, and targets kept out of reach as well, so an object is
--- marked before it can be used.
+-- marked before it can be used. A player who would rather keep their own
+-- Interact Key setting is never written to: the sparkles need it on, so the
+-- page says so instead.
+local function RespectInteract()
+    return F.Get("respectInteract") == true
+end
+
+-- Whether the sparkle cannot appear because the Interact Key is left to the
+-- player and they have it off.
+local function InteractOff()
+    if not RespectInteract() then return false end
+    return tonumber(C_CVar.GetCVar("softTargetInteract")) ~= 3
+end
+
 local function Wanted()
     local range = F.Get("range")
     local want = {
-        softTargetInteract = 3,
         SoftTargetInteractRange = range,
         SoftTargetInteractArc = 2,
         SoftTargetInteractOnlyInRange = 0,
         SoftTargetInteractRangeIsHard = 0,
     }
+    if not RespectInteract() then want.softTargetInteract = 3 end
     -- The game's own loot sparkle, turned off for a player who wants this one
     -- alone (it is the client's setting, so it is a hold like the others).
     if F.Get("hideGameSparkle") then want.outlineModeShowLootEffectWhenDisabled = 0 end
@@ -655,6 +668,10 @@ EllesmereUI._Sparkles = {
     FollowsProfession = function(kind) return AUTO_SKILL[kind] ~= nil end,
     KindOn = KindOn,
     Gathering = GatheringText,
+    -- The Interact Key: whether the player's own setting is left alone, and
+    -- whether that leaves nothing to sparkle.
+    RespectInteract = RespectInteract,
+    InteractOff = InteractOff,
     -- Each kind's own effect, and the picker that sets it.
     Effect = EffectFor,
     SetEffect = function(kind, style)
