@@ -194,6 +194,26 @@ local function IsWorldObject(unit)
     return not issecretvalue(isObject) and isObject == true
 end
 
+-- Whether the unit is a body worth a sparkle: dead, not a player, not a
+-- friend of the player's (whose corpse cannot be looted) and not someone
+-- else's kill. Alive units are turned away by the first test, which is most
+-- of the plates on screen.
+local function LootableBody(unit)
+    local dead = UnitIsDead(unit)
+    if issecretvalue(dead) or dead ~= true then return false end
+    local player = UnitIsPlayer(unit)
+    if issecretvalue(player) or player == true then return false end
+    if type(UnitIsFriend) == "function" then
+        local friend = UnitIsFriend("player", unit)
+        if not issecretvalue(friend) and friend == true then return false end
+    end
+    if type(UnitIsTapDenied) == "function" then
+        local tapped = UnitIsTapDenied(unit)
+        if not issecretvalue(tapped) and tapped == true then return false end
+    end
+    return true
+end
+
 -- The kind of the unit, or nil for something the sparkles leave alone. What
 -- the object says it is comes first, and what the loot window taught is the
 -- last word only for an object it says nothing about: a vein or a herb that
@@ -213,10 +233,8 @@ local function Classify(unit, guid)
         if id and learned and learned[id] then return "chest" end
         return nil
     end
-    -- A creature is worth a sparkle once it is a body to loot. A player's
-    -- corpse is not, and neither is the player's own.
-    local dead = UnitIsDead(unit)
-    if not issecretvalue(dead) and dead == true and not UnitIsPlayer(unit) then return "corpse" end
+    -- A creature is worth a sparkle once it is a body to loot.
+    if LootableBody(unit) then return "corpse" end
 end
 
 -- The kind of a token's unit, read once per unit it names: a plate comes and
@@ -246,6 +264,39 @@ local function TargetPlate(unit)
         local token = plates[i].namePlateUnitToken
         if token and UnitIsUnit(token, unit) then return plates[i] end
     end
+end
+
+-- How far away a unit is, squared, when the client can say.
+local function DistanceSq(unit)
+    if type(UnitDistanceSquared) ~= "function" then return nil end
+    local ok, d = pcall(UnitDistanceSquared, unit)
+    if not ok or issecretvalue(d) or type(d) ~= "number" then return nil end
+    return d
+end
+
+-- A body to sparkle, and the plate it stands on. The client's targeting marks
+-- what can be used, and a corpse cannot be used, so a body is not marked
+-- there: it is the nearest dead creature on a plate, within the sparkle's
+-- range when that can be measured.
+local function BodyOnPlates()
+    local C = C_NamePlate
+    if not (C and C.GetNamePlates) then return nil end
+    local range = F.Get("range")
+    local limit = range * range
+    local token, plate, near
+    local plates = C.GetNamePlates()
+    for i = 1, #plates do
+        local at = plates[i].namePlateUnitToken
+        if at and LootableBody(at) then
+            local d = DistanceSq(at)
+            if not d or d <= limit then
+                if not token or (d and (not near or d < near)) then
+                    token, plate, near = at, plates[i], d
+                end
+            end
+        end
+    end
+    return token, plate
 end
 
 -- A game object the loot window named is a container, whatever the client
@@ -365,9 +416,13 @@ local function Evaluate()
         -- one is still a body to loot (only a dead one classifies as a body).
         unit, kind = FOE, KindAt(FOE)
     end
-    if not (kind and KindOn(kind)) then HideSparkle(); return end
-    local plate = TargetPlate(unit)
-    if not plate then HideSparkle(); return end
+    if kind and not KindOn(kind) then HideSparkle(); return end
+    local plate = kind and TargetPlate(unit)
+    if not plate and KindOn("corpse") then
+        unit, plate = BodyOnPlates()
+        kind = plate and "corpse"
+    end
+    if not (kind and plate) then HideSparkle(); return end
     local r, g, b = Colour(kind)
     ShowSparkle(plate, EffectFor(kind), r, g, b)
 end

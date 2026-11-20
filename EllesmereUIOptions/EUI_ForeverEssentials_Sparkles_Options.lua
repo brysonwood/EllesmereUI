@@ -217,7 +217,7 @@ _G._EUI_BuildSparklesPage = function(pageName, parent, yOffset)
         { "herb", "Herbs", "Herbs, in the color you pick." },
         { "chest", "Treasure Chests", "Chests, crates and barrels, whatever the game calls them: the first loot of a kind teaches the sparkle which object it is." },
         { "quest", "Quest Objects", "Objects the quest log ties to a quest you are on." },
-        { "corpse", "Dead Bodies", "Creatures that are down. Turn the game's own loot sparkle off above to see this one alone." },
+        { "corpse", "Dead Bodies", "Creatures that are down and can be looted, found on their own nameplate: the game does not mark a body as an interact target, so this kind works with the Interact Key off too. Turn the game's own loot sparkle off above to see this one alone." },
         { "bobber", "Fishing Bobber", "Your fishing bobber, whenever the game's targeting picks it up." },
     }
 
