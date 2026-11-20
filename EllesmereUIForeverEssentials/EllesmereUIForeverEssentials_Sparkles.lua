@@ -82,7 +82,7 @@ local STYLE_ORDER = { "glow", "beam", "flare", "sparkle" }
 -- colors[kind] = { r, g, b }, and the container object IDs the loot window
 -- taught in containers, which survive a reset so chests stay known.
 local F = module.Feature("sparkles", {
-    enabled = false, range = 15, style = "glow",
+    enabled = false, range = 15, style = "glow", hideGameSparkle = false,
     ore = true, herb = true, chest = true, quest = true, corpse = true, bobber = true,
 })
 
@@ -299,19 +299,39 @@ end
 -------------------------------------------------------------------------------
 --  Held CVars
 -------------------------------------------------------------------------------
+-- How far a nameplate may show. The sparkle hangs on the target's plate, and
+-- the client hands a plate out only within its own nameplate distance, so the
+-- sparkle's range is taken only as far as that allows: Forever shortens the
+-- reach for a value above its own default, so the default is the ceiling. nil
+-- when the player's value already reaches far enough.
+local function WantPlateDistance()
+    local range = F.Get("range")
+    local cap = tonumber(C_CVar.GetCVarDefault("nameplateMaxDistance"))
+    local want = cap and math.min(range, cap) or range
+    local cur = tonumber(C_CVar.GetCVar("nameplateMaxDistance"))
+    if cur and cur >= want then return nil end
+    return math.ceil(want)
+end
+
 -- The client's soft-target settings: targeting on for both input styles
 -- (Enum.SoftTargetEnableFlags.Any, the value the Fishing key sets), its
 -- reach and arc, and targets kept out of reach as well, so an object is
 -- marked before it can be used.
 local function Wanted()
     local range = F.Get("range")
-    return {
+    local want = {
         softTargetInteract = 3,
         SoftTargetInteractRange = range,
         SoftTargetInteractArc = 2,
         SoftTargetInteractOnlyInRange = 0,
         SoftTargetInteractRangeIsHard = 0,
     }
+    -- The game's own loot sparkle, turned off for a player who wants this one
+    -- alone (it is the client's setting, so it is a hold like the others).
+    if F.Get("hideGameSparkle") then want.outlineModeShowLootEffectWhenDisabled = 0 end
+    local plate = WantPlateDistance()
+    if plate then want.nameplateMaxDistance = plate end
+    return want
 end
 
 -- Takes the holds, remembering what each CVar was before the first hold.
@@ -326,6 +346,20 @@ local function Hold()
         local cur = C_CVar.GetCVar(name)
         if cur ~= nil and cur ~= want then
             if EllesmereUI.HoldCVar(name, want, OWNER) and was[name] == nil then was[name] = cur end
+        end
+    end
+end
+
+-- A hold the settings no longer want goes back to the player's value at once,
+-- so a switch turned off inside the page takes effect without a reload.
+local function Prune()
+    local held = F.Read().held
+    if not held then return end
+    local values = Wanted()
+    for name, value in pairs(held) do
+        if values[name] == nil then
+            EllesmereUI.ReleaseCVar(name, value, OWNER)
+            held[name] = nil
         end
     end
 end
@@ -395,6 +429,95 @@ ev:SetScript("OnEvent", function(_, event, arg1)
 end)
 
 -------------------------------------------------------------------------------
+--  The options page's preview
+-------------------------------------------------------------------------------
+-- A sample plate in the content header with the sparkle under it, drawn with
+-- the style on the page and the colour of the kind its eye picked (nil: the
+-- eye is off). The frames outlive a page rebuild, as the other pages'
+-- previews do, so they are made once and taken over by the next build.
+local PREVIEW_H = 150
+local PREVIEW_NAMES = {
+    ore = "Ore Vein", herb = "Herb", chest = "Treasure Chest",
+    quest = "Quest Object", corpse = "Dead Body", bobber = "Fishing Bobber",
+}
+local preview
+local previewKind = "ore"
+
+-- The preview's layers are the page's style; a style change makes them anew.
+local function PreviewStyle(style)
+    local v = preview
+    if v.style == style then return end
+    v.style = style
+    for i = 1, #v.layers do
+        local f = v.layers[i].frame
+        v.layers[i].group:Stop()
+        f:Hide()
+        f:SetParent(nil)
+    end
+    v.layers = {}
+    v.playing = false
+    local specs = STYLES[style] or STYLES.glow
+    for i = 1, #specs do v.layers[i] = BuildLayer(v.host, specs[i]) end
+end
+
+-- One repaint for the lot: the name, the colours and whether the sparkle runs.
+local function RefreshPreview()
+    local v = preview
+    if not v then return end
+    local kind = previewKind
+    v.name:SetText(kind and PREVIEW_NAMES[kind] or "")
+    PreviewStyle(F.Get("style"))
+    local r, g, b = 1, 1, 1
+    if kind then r, g, b = Colour(kind) end
+    local on = kind ~= nil
+    for i = 1, #v.layers do
+        local layer = v.layers[i]
+        layer.texture:SetVertexColor(r, g, b)
+        if on ~= v.playing then
+            if on then layer.frame:Show(); layer.group:Play() else layer.group:Stop(); layer.frame:Hide() end
+        end
+    end
+    v.playing = on
+end
+
+local function CreateSettingsPreview(parent, availableWidth, onHeightChanged)
+    local v = preview
+    if not v then
+        v = { layers = {} }
+        v.view = CreateFrame("Frame", nil, parent)
+        v.view:SetHeight(PREVIEW_H)
+        v.view:SetScript("OnShow", RefreshPreview)
+        v.view:SetScript("OnHide", function()
+            v.playing = false
+            for i = 1, #v.layers do v.layers[i].group:Stop() end
+        end)
+        local plate = CreateFrame("Frame", nil, v.view)
+        plate:SetSize(150, 12)
+        plate:SetPoint("CENTER", v.view, "CENTER", 0, 2)
+        local fill = plate:CreateTexture(nil, "BACKGROUND")
+        fill:SetAllPoints()
+        fill:SetColorTexture(0.24, 0.24, 0.27, 1)
+        EllesmereUI.PP.CreateBorder(plate, 0, 0, 0, 1, 1, "OVERLAY", 2)
+        v.name = EllesmereUI.MakeFont(v.view, 12, nil, 1, 1, 1, 1)
+        v.name:SetPoint("BOTTOM", plate, "TOP", 0, 5)
+        v.host = CreateFrame("Frame", nil, v.view)
+        v.host:SetSize(SIZE, SIZE)
+        v.host:SetPoint("CENTER", plate, "CENTER", 0, OFFSET_Y)
+        v.host:EnableMouse(false)
+        v.previewHeight = PREVIEW_H
+        preview = v
+    end
+    v.view:SetParent(parent)
+    v.view:ClearAllPoints()
+    v.view:SetPoint("TOPLEFT")
+    v.view:SetPoint("TOPRIGHT")
+    v.view:Show()
+    RefreshPreview()
+    if onHeightChanged then onHeightChanged(PREVIEW_H) end
+    return v
+end
+
+-------------------------------------------------------------------------------
 --  Apply
 -------------------------------------------------------------------------------
 -- Login and the options; takes effect at once in both directions. The CVars
@@ -416,6 +539,7 @@ local function Apply()
         ev:UnregisterAllEvents()
         return
     end
+    Prune()
     Hold()
     for i = 1, #WATCH do ev:RegisterEvent(WATCH[i]) end
     Evaluate()
@@ -430,11 +554,21 @@ EllesmereUI._Sparkles = {
     Refresh = Evaluate,
     STYLE_NAMES = STYLE_NAMES,
     STYLE_ORDER = STYLE_ORDER,
+    -- The page's live preview in the content header, and the eye that picks
+    -- which kind's colour it shows (nil: no sparkle drawn).
+    CreateSettingsPreview = CreateSettingsPreview,
+    RefreshPreview = RefreshPreview,
+    PreviewKind = function() return previewKind end,
+    SetPreviewKind = function(kind)
+        previewKind = kind
+        RefreshPreview()
+    end,
     SetColor = function(kind, r, g, b)
         local cfg = F.Cfg()
         cfg.colors = cfg.colors or {}
         cfg.colors[kind] = { r = r, g = g, b = b }
         Evaluate()
+        if previewKind == kind then RefreshPreview() end
     end,
 }
 

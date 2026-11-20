@@ -3,21 +3,23 @@ if EUI_CLIENT_BLOCKED then return end -- pre-12.1 client failsafe (EllesmereUI_C
 --  EUI_ForeverEssentials_Options.lua
 --  Registers the Forever Essentials sidebar addon (WoW Forever only) with its
 --  tabs:
---    * General -- quality of life features (built by EUI_ForeverEssentials_General_Options.lua)
---    * Travel -- flight timer (built by EUI_ForeverEssentials_Travel_Options.lua)
---    * Threat -- threat meter (built by EUI_ForeverEssentials_Threat_Options.lua)
---    * Loot   -- loot feed (built by EUI_ForeverEssentials_Loot_Options.lua)
---    * Macros -- macro manager (built by EUI_ForeverEssentials_Macros_Options.lua)
+--    * General       -- quality of life features (built by EUI_ForeverEssentials_General_Options.lua)
+--    * Loot Sparkles -- sparkles on interactables (built by EUI_ForeverEssentials_Sparkles_Options.lua)
+--    * Travel        -- flight timer (built by EUI_ForeverEssentials_Travel_Options.lua)
+--    * Threat        -- threat meter (built by EUI_ForeverEssentials_Threat_Options.lua)
+--    * Loot          -- loot feed (built by EUI_ForeverEssentials_Loot_Options.lua)
+--    * Macros        -- macro manager (built by EUI_ForeverEssentials_Macros_Options.lua)
 -------------------------------------------------------------------------------
 -- Page names are DEEP-LINK IDENTIFIERS: every NavigateToElementSettings tuple
 -- and What's New nav carries them as strings and fails SILENTLY on a mismatch.
 if not EllesmereUI._ModuleNS["EllesmereUIForeverEssentials"] then return end  -- module disabled: no options page
 
-local PAGE_GENERAL = "General"
-local PAGE_TRAVEL  = "Travel"
-local PAGE_THREAT  = "Threat"
-local PAGE_LOOT    = "Loot"
-local PAGE_MACROS  = "Macros"
+local PAGE_GENERAL  = "General"
+local PAGE_SPARKLES = "Loot Sparkles"
+local PAGE_TRAVEL   = "Travel"
+local PAGE_THREAT   = "Threat"
+local PAGE_LOOT     = "Loot"
+local PAGE_MACROS   = "Macros"
 
 -- Item quality dropdown values and order from Poor up to last, each in its
 -- colour (the General and Loot pages).
@@ -47,11 +49,14 @@ initFrame:SetScript("OnEvent", function(self)
     EllesmereUI:RegisterModule("EllesmereUIForeverEssentials", {
         title       = "Forever Essentials",
         description = "Essential tools for WoW Forever.",
-        pages       = { PAGE_GENERAL, PAGE_TRAVEL, PAGE_THREAT, PAGE_LOOT, PAGE_MACROS },
+        pages       = { PAGE_GENERAL, PAGE_SPARKLES, PAGE_TRAVEL, PAGE_THREAT, PAGE_LOOT, PAGE_MACROS },
         searchTerms = { "flight timer", "flight path", "threat", "threat meter", "aggro", "loot", "loot feed", "reputation", "currency", "uprank", "spell rank", "junk", "junk items", "macro", "macros", "macro manager", "simplified stats", "item stats", "stat colors", "tooltip stats", "world map", "map", "sidebar", "map background", "click through", "reveal", "unexplored", "fog of war", "fishing skill", "quest reward", "quest rewards", "sell value", "boat", "zeppelin", "zone exit", "dungeon entrance", "instance", "sparkle", "sparkles", "glow", "beam", "flare", "ore", "ore vein", "herb", "herbs", "mining", "herbalism", "node", "chest", "treasure", "quest object", "dead body", "corpse", "bobber" },
         buildPage   = function(pageName, parent, yOffset)
             if pageName == PAGE_GENERAL and _G._EUI_BuildForeverGeneralPage then
                 return _G._EUI_BuildForeverGeneralPage(pageName, parent, yOffset)
+            end
+            if pageName == PAGE_SPARKLES and _G._EUI_BuildSparklesPage then
+                return _G._EUI_BuildSparklesPage(pageName, parent, yOffset)
             end
             if pageName == PAGE_TRAVEL and _G._EUI_BuildFlightTimerPage then
                 return _G._EUI_BuildFlightTimerPage(pageName, parent, yOffset)
@@ -69,6 +74,7 @@ initFrame:SetScript("OnEvent", function(self)
         -- The Travel, Threat, Loot and Macros headers live in the content header; declaring a
         -- page's builder makes a cached page whose header was dropped rebuild with it.
         getHeaderBuilder = function(pageName)
+            if pageName == PAGE_SPARKLES then return _G._EUI_SparklesHeaderBuilder end
             if pageName == PAGE_TRAVEL then return _G._EUI_TravelHeaderBuilder end
             if pageName == PAGE_THREAT then return _G._EUI_ThreatHeaderBuilder end
             if pageName == PAGE_LOOT then return _G._EUI_LootHeaderBuilder end
